@@ -7,16 +7,17 @@ import os
 router = APIRouter()
 TRACK_DEFAULT_LIMIT = int(os.getenv("TRACK_DEFAULT_LIMIT", "50"))
 
-@router.get("/health")
-async def health():
-    return {"status": "ok"}
 
-@router.get("/", include_in_schema=False)
-def root():
+@router.get("/", include_in_schema=True)
+async def root():
     # redireciona a raiz para a documentação
     # return RedirectResponse(url="/docs")
     # (alternativa) retornar JSON:
     return {"status": "ok", "docs": "/docs", "health": "/health"}
+
+@router.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @router.get("/devices")
 async def list_devices():
