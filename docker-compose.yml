@@ -1,3 +1,12 @@
+networks:
+  proxy:
+    external: true        # rede do NPM (já existente)
+  telemetry:
+    driver: bridge        # rede interna da app
+
+volumes:
+  dbdata:
+
 services:
   db:
     image: postgres:16-alpine
@@ -5,17 +14,46 @@ services:
       POSTGRES_DB: telemetry
       POSTGRES_USER: telemetry
       POSTGRES_PASSWORD: telemetry
-    ports: ["5432:5432"]
-    volumes: [dbdata:/var/lib/postgresql/data]
+      TZ: America/Belem
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    networks: [telemetry]
+    expose:
+      - "5432"
+    restart: unless-stopped
+
   api:
     build:
-      context: .          # <- este ponto tem que conter o main.py
+      context: .              # diretório com Dockerfile, main.py e pasta app/
       dockerfile: Dockerfile
+    # Se usar Portainer "Add Stack", o env_file pode não carregar.
+    # Nesse caso, troque por 'environment:' com as variáveis.
     env_file: .env
+    environment:
+      TZ: America/Belem
     depends_on: [db]
-    ports:
-      - "8000:8000"
-      - "5010:5010"
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-volumes:
-  dbdata:
+    command: ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--proxy-headers","--forwarded-allow-ips","*"]
+
+    # Sem publicar portas no host; o NPM acessa via rede 'proxy'
+    expose:
+      - "8000"    # HTTP (api-track.mesquitapmpa.com.br)
+      - "5010"    # TCP TRV (track.mesquitapmpa.com.br)
+
+    networks:
+      telemetry:
+      proxy:
+        aliases:
+          - telemetry-api   # use este host no NPM (Forward Host)
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=5)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+    restart: unless-stopped
