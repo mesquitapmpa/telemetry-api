@@ -6,10 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copia o código
-COPY app ./app
-COPY main.py .        # seu main está na raiz
-# COPY .env .         # (opcional) só se quiser a .env dentro da imagem
+# copie cada coisa para um destino claro
+COPY app/ ./app/
+COPY main.py ./main.py
 
 EXPOSE 8000 5010
 CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--proxy-headers","--forwarded-allow-ips","*"]
