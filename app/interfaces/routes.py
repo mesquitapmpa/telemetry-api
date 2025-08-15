@@ -11,6 +11,13 @@ TRACK_DEFAULT_LIMIT = int(os.getenv("TRACK_DEFAULT_LIMIT", "50"))
 async def health():
     return {"status": "ok"}
 
+@router.get("/", include_in_schema=False)
+def root():
+    # redireciona a raiz para a documentação
+    # return RedirectResponse(url="/docs")
+    # (alternativa) retornar JSON:
+    return {"status": "ok", "docs": "/docs", "health": "/health"}
+
 @router.get("/devices")
 async def list_devices():
     async with AsyncSessionLocal() as sess:
