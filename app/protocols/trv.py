@@ -1,14 +1,21 @@
-# app/protocols/trv_gt06.py
 import asyncio
-import struct
-import binascii
 import logging
 import os
+import json
+import re
+import inspect
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Any, Dict
 
-from app.usecases.save_position import save_position
-from app.usecases.device_helpers import ensure_device_canonical
+# Ajuste conforme seu projeto
+from app.usecases.save_position import ensure_device, save_position
+
+# ==========================
+# Configurações
+# ==========================
+TRV_PORT = int(os.getenv("TRV_PORT", "5010"))
+ALLOW_IP_CACHE = os.getenv("TRV_ALLOW_IP_CACHE", "false").lower() == "true"
+VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
 
 logger = logging.getLogger("trv_gt06")
 if not logger.handlers:
@@ -17,387 +24,581 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
-VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
-LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "false").lower() == "true"  # habilita logs no estilo antigo (RX proto=..., TX_ACK=...)
+# Protótipos GT06 que carregam posição neste firmware (360gps/GF22)
+GT06_PROTOS_POS = {0x12, 0x10, 0x11}
 
-# ============================================================
-# Helpers de log legado
-# ============================================================
-def _hex_spaced(b: bytes) -> str:
-    return " ".join(f"{x:02X}" for x in b)
+# ==========================
+# Compat: funções sync/async e assinaturas flexíveis
+# ==========================
+async def _call_maybe_async(fn, *args, **kwargs):
+    """Chama função sync/async; se TypeError por kwargs, tenta posicional."""
+    try:
+        res = fn(*args, **kwargs)
+    except TypeError:
+        res = fn(*args)
+    if inspect.isawaitable(res):
+        return await res
+    return res
 
-# ============================================================
-# Checksums
-# ============================================================
-def crc16_x25(data: bytes) -> int:
-    """
-    CRC-16/X25 (refletido), init=0xFFFF, xorout=0xFFFF (endianness de campo: big-endian).
-    """
+async def _ensure_device_safe(imei: str, protocol: str, model: Optional[str] = None):
+    """Tenta ensure_device posicional e, se falhar, nomeado. Nunca bloqueia o fluxo."""
+    try:
+        return await _call_maybe_async(ensure_device, imei, protocol, model)
+    except Exception as e1:
+        try:
+            return await _call_maybe_async(ensure_device, imei=imei, protocol=protocol, model=model)
+        except Exception as e2:
+            logger.exception("[ensure_device] falhou (posicional=%s / nomeado=%s)", e1, e2)
+            return None
+
+def _normalize_param_name(name: str) -> str:
+    name = name.lower()
+    aliases = {
+        "latitude": "lat", "lat": "lat",
+        "longitude": "lon", "lng": "lon", "long": "lon",
+        "fix_time": "fix_time", "fixtime": "fix_time", "ts": "fix_time", "dt": "fix_time",
+        "speed": "speed_knots", "speed_knots": "speed_knots", "spd": "speed_knots", "vel": "speed_knots",
+        "course": "course_deg", "course_deg": "course_deg", "crs": "course_deg", "heading": "course_deg",
+        "valid": "valid",
+        "raw": "raw",
+        "imei": "imei",
+    }
+    return aliases.get(name, name)
+
+async def _save_position_safe(imei: str, lat: float, lon: float, dt: datetime,
+                              speed_knots: Optional[float], course_deg: Optional[float],
+                              valid: bool, raw: str):
+    """Compat: tenta por nomes (introspecção) e cai para ordens posicionais comuns."""
+    # 1) Tentativa por nomes
+    try:
+        sig = inspect.signature(save_position)
+        params = list(sig.parameters.keys())
+        kw: Dict[str, Any] = {}
+        for p in params:
+            pn = _normalize_param_name(p)
+            if pn == "imei": kw[p] = imei
+            elif pn == "lat": kw[p] = lat
+            elif pn == "lon": kw[p] = lon
+            elif pn == "fix_time": kw[p] = dt
+            elif pn == "speed_knots": kw[p] = speed_knots
+            elif pn == "course_deg": kw[p] = course_deg
+            elif pn == "valid": kw[p] = valid
+            elif pn == "raw": kw[p] = raw
+        if kw:
+            return await _call_maybe_async(save_position, **kw)
+    except Exception:
+        pass
+
+    # 2) Ordens posicionais comuns
+    attempts = [
+        (imei, lat, lon, dt, speed_knots, course_deg, valid, raw),
+        (imei, lat, lon, speed_knots, course_deg, dt, valid, raw),
+        (imei, dt, lat, lon, speed_knots, course_deg, valid, raw),
+    ]
+    last_err = None
+    for args in attempts:
+        try:
+            return await _call_maybe_async(save_position, *args)
+        except TypeError as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+
+# ==========================
+# Utilitários – GT06
+# ==========================
+def _gt06_bcd_imei(b: bytes) -> str:
+    """8 bytes BCD → 16 dígitos; retornar 15 dígitos IMEI sem zeros à esquerda."""
+    s = ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
+    return s.lstrip('0')[:15]
+
+def _crc16_x25(data: bytes) -> int:
+    """CRC-16/X25 (ITU), poly 0x8408 (reflected), init 0xFFFF, xorout 0xFFFF."""
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if (crc & 1) != 0:
+            if crc & 1:
                 crc = (crc >> 1) ^ 0x8408
             else:
                 crc >>= 1
-    crc = ~crc & 0xFFFF
-    # muitos firmwares esperam o campo em big-endian; retornamos já como inteiro "normal"
-    return ((crc & 0xFF) << 8) | (crc >> 8)
+    return (~crc) & 0xFFFF
 
-def sum8(data: bytes) -> int:
+def _sum_cs(data: bytes) -> int:
+    """Checksum simples de 1 byte (soma & 0xFF) usado por clones GT06."""
     return sum(data) & 0xFF
 
-# ============================================================
-# ACK (espelha checksum/serial)
-# ============================================================
-def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
-    """
-    Monta ACK no formato do header recebido (0x7878 ou 0x7979) e mesmo modo de checksum.
-    - Para CRC16: length = type(1) + serial(2) + CRC(2)
-    - Para SUM-8: length = type(1) + serial(2) + SUM(1)
-    """
-    hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
+def _ack_crc(proto: int, serial: bytes) -> bytes:
+    """ACK com CRC-16 (2 bytes): 78 78 05 <proto> <serial_hi> <serial_lo> <CRC_hi> <CRC_lo> 0D 0A"""
+    if len(serial) != 2:
+        serial = serial[:2].rjust(2, b"\x00")
+    body = bytes([0x05, proto]) + serial
+    crc = _crc16_x25(body)
+    return b"\x78\x78" + body + crc.to_bytes(2, "big") + b"\x0D\x0A"
 
-    # normaliza serial (muitos dispositivos esperam 2 bytes em ACK)
-    serial = serial_bytes or b""
-    if len(serial) == 0:
-        serial = b"\x00\x00"
-    elif len(serial) == 1:
-        serial = b"\x00" + serial
+def _ack_sum(proto: int, serial: bytes) -> bytes:
+    """ACK com checksum 1 byte (SUM): 78 78 05 <proto> <serial_hi> <serial_lo> <CS> 0D 0A"""
+    if len(serial) != 2:
+        serial = serial[:2].rjust(2, b"\x00")
+    body = bytes([0x05, proto]) + serial
+    cs = _sum_cs(body)
+    return b"\x78\x78" + body + bytes([cs]) + b"\x0D\x0A"
+
+def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
+    """
+    Localiza o frame pelo terminador 0D 0A e determina cs_len por validação real.
+    Retorna (end, cs_len), onde end é EXCLUSIVO e cs_len ∈ {1,2}.
+    """
+    if len(buf) < i + 3:
+        return None
+    tail = buf.find(b"\x0D\x0A", i + 4)
+    if tail < 0:
+        return None
+    end = tail + 2  # índice EXCLUSIVO
+
+    # Tenta CRC-16 (2 bytes)
+    if end - (i + 3) - 2 >= 2 + 3:
+        body_crc = buf[i + 3 : end - (2 + 2)]
+        crc_field = int.from_bytes(buf[end - 4 : end - 2], "big")
+        if _crc16_x25(body_crc) == crc_field:
+            return (end, 2)
+
+    # Tenta SUM (1 byte)
+    if end - (i + 3) - 2 >= 1 + 3:
+        body_sum = buf[i + 3 : end - (1 + 2)]
+        sum_field = buf[end - 3]
+        if (_sum_cs(body_sum) & 0xFF) == sum_field:
+            return (end, 1)
+
+    # Fallback seguro: assume SUM
+    return (end, 1)
+
+def _gt06_validate_by_body(pkt: bytes, cs_len: int) -> bool:
+    """Valida checksum contra o 'body' (entre len e checksum), sem depender do len declarativo."""
+    if not VALIDATE_GT06_CRC:
+        return True
+    L = len(pkt)
+    body = pkt[3 : L - (cs_len + 2)]
+    if cs_len == 2:
+        got = int.from_bytes(pkt[L - 4 : L - 2], "big")
+        return got == _crc16_x25(body)
     else:
-        serial = serial[-2:]  # garante 2 bytes
+        got = pkt[L - 3]
+        return got == (_sum_cs(body) & 0xFF)
 
-    body_wo_chk = bytes([msg_type]) + serial
-
-    if checksum_mode == "CRC16":
-        length = 1 + len(serial) + 2
-        pkt_wo_crc = hdr + bytes([length]) + body_wo_chk
-        crc = crc16_x25(pkt_wo_crc[2:])
-        return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
-
-    # SUM-8
-    length = 1 + len(serial) + 1
-    pkt_wo_sum = hdr + bytes([length]) + body_wo_chk
-    cs = sum8(pkt_wo_sum[2:])
-    return pkt_wo_sum + bytes([cs]) + b"\x0D\x0A"
-
-# ============================================================
-# Utils
-# ============================================================
-def parse_datetime_bcd(dt6: bytes) -> datetime:
-    if len(dt6) < 6:
-        return datetime.now(timezone.utc)
-    yy, mm, dd, hh, mi, ss = dt6[:6]
-    year = 2000 + (yy % 100)
+def _gt06_parse_position(core: bytes):
+    """
+    Payload SEM serial (proto + campos), para 0x12/0x10/0x11:
+      [0]    proto (0x12/0x10/0x11)
+      [1:7]  YY MM DD hh mm ss
+      [7]    sat/status
+      [8:12] lat_raw (1/1_800_000)
+      [12:16] lon_raw (1/1_800_000)
+      [16]   speed_kmh
+      [17:19] course/status (10 bits de rumo + flags)
+    Flags típicas:
+      bit10: realtime/history
+      bit11: GPS fix
+      bit12: 0=E, 1=W  (aplica sinal no lon)
+      bit13: 0=N, 1=S  (aplica sinal no lat)
+    """
+    if len(core) < 19 or core[0] not in GT06_PROTOS_POS:
+        return None
+    yy, mm, dd, hh, mi, ss = core[1:7]
     try:
-        return datetime(year, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
+        dt = datetime(2000 + yy, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
+    except ValueError:
+        dt = datetime.now(timezone.utc)
 
-def decode_bcd_imei(imei_bcd: bytes) -> str:
-    # IMEI como BCD (8 bytes => 16 dígitos)
-    s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)
-    return s.lstrip('0')
-
-def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
-    """
-    payload do LOGIN (sem o byte de 'type' 0x01).
-    Suporta:
-      - 0x08 + 8 bytes BCD (padrão GT06)
-      - 0x0F + 15 bytes ASCII
-      - fallback: varrer janelas de 8 bytes plausíveis
-    """
-    if not payload:
-        return None
-
-    # ASCII 15 (0x0F)
-    if len(payload) >= 1 and payload[0] == 0x0F and len(payload) >= 1 + 15:
-        try:
-            s = payload[1:1+15].decode()
-            if s.isdigit() and len(s) == 15:
-                return s
-        except Exception:
-            pass
-
-    # BCD 8 (0x08)
-    if len(payload) >= 1 and payload[0] == 0x08 and len(payload) >= 1 + 8:
-        s = decode_bcd_imei(payload[1:1+8])
-        s = s[:15]
-        if s.isdigit() and len(s) == 15:
-            return s
-
-    # Fallback: varrer janelas de 8 bytes
-    for i in range(0, max(0, len(payload) - 7)):
-        s = decode_bcd_imei(payload[i:i+8])[:15]
-        if s.isdigit() and len(s) == 15:
-            return s
-    return None
-
-def parse_gps_basic(payload: bytes) -> Optional[dict]:
-    """
-    GPS básico GT06 (0x10/0x11/0x12):
-      [time6][flags1][lat4][lon4][speed1][course2]
-    - lat/lon vêm SEM sinal; hemisfério está nos bits 12/13 do campo course/status.
-    - bit11 => GPS fix (1=fixed)
-    - bit12 => 1=West (lon negativa)
-    - bit13 => 1=South (lat negativa)
-    """
-    if len(payload) < 6+1+4+4+1+2:
-        return None
-
-    dt = parse_datetime_bcd(payload[0:6])
-
-    # flags1 (nem sempre usado; alguns firmwares colocam outras infos aqui)
-    # Não confiamos nesse bit para 'valid'; usamos bit11 do course/status (padrão GT06)
-    # flags = payload[6]
-
-    lat_raw = int.from_bytes(payload[7:11], "big", signed=False)
-    lon_raw = int.from_bytes(payload[11:15], "big", signed=False)
-    speed_kmh = payload[15] * 1.852
-
-    course_flags = struct.unpack(">H", payload[16:18])[0]
-    course = float(course_flags & 0x03FF)
-    gps_fixed = bool(course_flags & (1 << 11))
-    west = bool(course_flags & (1 << 12))
-    south = bool(course_flags & (1 << 13))
-
+    lat_raw = int.from_bytes(core[8:12], "big")
+    lon_raw = int.from_bytes(core[12:16], "big")
     lat = lat_raw / 1800000.0
     lon = lon_raw / 1800000.0
-    if south:
-        lat = -lat
-    if west:
+
+    speed_knots = core[16] * 0.539957  # km/h → nós
+    flags = int.from_bytes(core[17:19], "big")
+    course = float(flags & 0x03FF)
+
+    ew_west = bool(flags & (1 << 12))
+    ns_south = bool(flags & (1 << 13))
+    gps_fixed = bool(flags & (1 << 11))
+
+    if ew_west:
         lon = -lon
+    if ns_south:
+        lat = -lat
 
-    return {
-        "time": dt,
-        "lat": lat,
-        "lon": lon,
-        "speed_kmh": speed_kmh,
-        "course": course,
-        "valid": gps_fixed,
-        "raw_flags": course_flags,
-    }
+    return lat, lon, float(speed_knots), course, dt, gps_fixed
 
-# ============================================================
-# Detector de checksum/serial
-# ============================================================
-def detect_checksum_and_serial(hdr: bytes, length: int, body_and_footer: bytes) -> Tuple[str, bytes, bytes]:
+# ==========================
+# Helpers de IMEI (GT06) + cache last10→full
+# ==========================
+_gt06_last10_to_full: dict[str, str] = {}  # last10 -> imei15
+
+def _parse_env_last10_map():
     """
-    Retorna (checksum_mode, serial_bytes, payload_full)
-    payload_full = [type(1)] + [payload... (+ possivel serial dentro)]
+    TRV_GT06_LAST10_MAP exemplos:
+      - JSON: {"6126102974":"861261029740319"}
+      - CSV : "6126102974:861261029740319,1234567890:861234567890123"
     """
-    if len(body_and_footer) < 1 + 2:  # pelo menos type + CRLF
-        return ("SUM8", b"", b"")
+    raw = os.getenv("TRV_GT06_LAST10_MAP", "").strip()
+    if not raw:
+        return
+    try:
+        if raw.startswith("{"):
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, str) and len(k) == 10 and len(v) == 15 and k.isdigit() and v.isdigit():
+                        _gt06_last10_to_full[k] = v
+        else:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            for p in parts:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    k = k.strip(); v = v.strip()
+                    if len(k) == 10 and len(v) == 15 and k.isdigit() and v.isdigit():
+                        _gt06_last10_to_full[k] = v
+    except Exception:
+        logger.exception("[GT06] Falha ao ler TRV_GT06_LAST10_MAP")
 
-    if body_and_footer[-2:] != b"\x0D\x0A":
-        return ("SUM8", b"", b"")
+_parse_env_last10_map()
 
-    core = body_and_footer[:-2]  # remove CRLF
-    msg_type_b = core[:1]
-    rest = core[1:]
+def _gt06_extract_login_imei(body: bytes) -> Optional[str]:
+    """
+    Extrai IMEI completo (15 dígitos) do pacote de LOGIN (proto=0x01).
+    Suporta:
+      - BCD: len=0x08 seguido de 8 bytes (mais comum)
+      - ASCII: len=0x0F seguido de 15 bytes ASCII numéricos
+      - Fallback: procurar 8 bytes BCD plausíveis no body
+    body = [proto] ... [serial_hi serial_lo]  (já “body” sem cabeçalho e checksum)
+    """
+    if len(body) < 5:
+        return None
+    rest = body[1:-2]  # remove proto e serial
+    if not rest:
+        return None
 
-    # 1) Tentar CRC16: últimos 2 bytes são CRC
-    if len(rest) >= 2:
-        crc_recv = struct.unpack(">H", rest[-2:])[0]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-2]
-        crc_calc = crc16_x25(candidate[2:])
-        if crc_calc == crc_recv:
-            serial = rest[-4:-2] if len(rest) >= 4 else b"\x00\x00"
-            payload_full = msg_type_b + rest[:-2]  # inclui serial ao final (se houver)
-            return ("CRC16", serial, payload_full)
-
-    # 2) Tentar SUM-8: último byte é soma
+    # Formatos com len explícito
     if len(rest) >= 1:
-        cs_recv = rest[-1]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-1]
-        if sum8(candidate[2:]) == cs_recv:
-            serial = rest[-3:-1] if len(rest) >= 3 else b""
-            payload_full = msg_type_b + rest[:-1]
-            return ("SUM8", serial, payload_full)
+        declared_len = rest[0]
+        payload = rest[1:]
 
-    # 3) Degrada (frames ultra-curtos / keepalive mínimo)
-    return ("SUM8", b"", msg_type_b + rest)
+        # ASCII (0x0F)
+        if declared_len == 0x0F and len(payload) >= 15:
+            try:
+                s = payload[:15].decode()
+                if s.isdigit() and len(s) == 15:
+                    return s
+            except Exception:
+                pass
 
-# ============================================================
-# Sessão por conexão (armazenar device canônico pós-login)
-# ============================================================
-class ConnState:
-    __slots__ = ("device", "imei_seen")
-    def __init__(self):
-        self.device: Optional[Dict[str, Any]] = None  # {"id":..., "imei":...}
-        self.imei_seen: Optional[str] = None
+        # BCD (0x08)
+        if declared_len == 0x08 and len(payload) >= 8:
+            s = _gt06_bcd_imei(payload[:8])
+            if s.isdigit() and len(s) == 15:
+                return s
 
-# ============================================================
-# Handlers
-# ============================================================
-async def handle_login(payload: bytes, peer: str, state: ConnState):
-    """
-    LOGIN GT06 (type 0x01).
-    payload pode vir como:
-      0x08 <8 bytes BCD IMEI> [ ... ]
-      0x0F <15 ASCII IMEI>    [ ... ]
-    """
-    imei = extract_login_imei_from_payload(payload) or ""
-    state.imei_seen = imei or state.imei_seen
+    # Fallback: procurar 8 bytes plausíveis
+    for off in range(0, max(0, len(rest) - 7)):
+        cand = rest[off:off+8]
+        if len(cand) == 8:
+            s = _gt06_bcd_imei(cand)
+            if s.isdigit() and len(s) == 15:
+                return s
+    return None
 
-    if not (imei and imei.isdigit() and len(imei) == 15):
-        logger.warning("[GT06] LOGIN sem IMEI válido/decodificável; sessão sem device. peer=%s", peer)
-        return
+# ==========================
+# Utilitários – TRV (GF22)
+# ==========================
+_trv_login_re = re.compile(r"^TRVAP00(?P<imei>\d{15})#$")
 
-    device = await ensure_device_canonical("gt06", imei)
-    if device:
-        state.device = {"id": device.get("id"), "imei": device.get("imei")}
-        logger.info("[GT06] LOGIN OK: device_id=%s imei=%s peer=%s",
-                    state.device['id'], state.device['imei'], peer)
-    else:
-        logger.warning("[GT06] LOGIN com IMEI válido, mas sem device canônico. peer=%s", peer)
+def _trv_ack_login() -> str:
+    now = datetime.now(timezone.utc)
+    return f"TRVBP00{now:%y%m%d%H%M%S}#"
 
-async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
-    gps = parse_gps_basic(payload)
-    if not gps:
-        logger.warning("[GT06] GPS payload curto/indecifrável: %s",
-                       binascii.hexlify(payload).decode().upper())
-        return
+def _trv_ack_heartbeat() -> str:
+    return "TRVZP16#"
 
-    # Garante device canônico (se pulou login)
-    if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) >= 15:
-        try:
-            dev = await ensure_device_canonical("gt06", state.imei_seen)
-            if dev:
-                state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
-        except Exception:
-            pass
+def _trv_parse_yp14(line: str):
+    m = re.search(
+        r"TRVYP14(?P<d>\d{6})(?P<v>[AV])"
+        r"(?P<latdeg>\d{2})(?P<latmin>\d{2}\.\d+)(?P<lats>[NS])"
+        r"(?P<londeg>\d{3})(?P<lonmin>\d{2}\.\d+)(?P<lons>[EW])"
+        r"(?P<spd>\d+\.\d+)(?P<crs>\d+\.\d+)#",
+        line,
+    )
+    if not m:
+        return None
+    d = m.group("d")  # YYMMDD
+    base = datetime.strptime(d, "%y%m%d").replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    fix_time = base.replace(hour=now.hour, minute=now.minute, second=now.second)
 
-    if not state.device:
-        logger.warning("[GT06] Sem device canônico; descartando posição para evitar IMEI curto.")
-        return
+    lat_deg = int(m.group("latdeg")); lat_min = float(m.group("latmin"))
+    lon_deg = int(m.group("londeg")); lon_min = float(m.group("lonmin"))
+    lat = lat_deg + (lat_min / 60.0); lon = lon_deg + (lon_min / 60.0)
+    if m.group("lats") == "S": lat = -lat
+    if m.group("lons") == "W": lon = -lon
+    spd_knots = float(m.group("spd")); crs = float(m.group("crs"))
+    valid = m.group("v") == "A"
+    return lat, lon, spd_knots, crs, fix_time, valid
 
-    payload_to_save = {
-        "protocol": "gt06",
-        "device_id": state.device["id"],
-        "time": gps["time"].isoformat(),
-        "lat": gps["lat"],
-        "lon": gps["lon"],
-        "speed_kmh": gps["speed_kmh"],
-        "course": gps["course"],
-        "valid": gps["valid"],
-        "raw": raw_frame_hex,
-    }
-    await save_position(payload_to_save)
-    logger.info("[GT06] POS salva device_id=%s lat=%.6f lon=%.6f v=%.1fkm/h curso=%.1f valid=%s",
-                state.device['id'], gps['lat'], gps['lon'], gps['speed_kmh'], gps['course'], gps['valid'])
+# ==========================
+# Caches simples
+# ==========================
+_peer_cache: dict[str, str] = {}       # TRV  : IP → IMEI
+_gt06_peer_cache: dict[str, str] = {}  # GT06 : IP → IMEI (full)
+# (opcional) cache de sessão já é por conexão (variável gt06_imei)
 
-# ============================================================
-# Frame loop
-# ============================================================
-async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = await reader.read(n - len(buf))
-        if not chunk:
-            raise asyncio.IncompleteReadError(buf, n)
-        buf += chunk
-    return buf
-
-async def process_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
-    hdr = await read_exact(reader, 2)
-    if hdr not in (b"\x78\x78", b"\x79\x79"):
-        # Pode ser lixo/ASCII — tenta consumir até CRLF só pra limpar
-        try:
-            line = hdr + await reader.readuntil(b"\x0D\x0A")
-            logger.debug("[GT06] ASCII? %r", line)
-        except Exception:
-            pass
-        return
-
-    length_b = await read_exact(reader, 1)
-    length = length_b[0]
-
-    # type + payload + checksum(?) + CRLF (2)
-    body_and_footer = await read_exact(reader, length + 2)
-
-    raw = hdr + length_b + body_and_footer
-    raw_hex = binascii.hexlify(raw).decode().upper()
-
-    # Log estilo legado do pacote bruto (CHUNK ...)
-    if LOG_LEGACY:
-        try:
-            logger.info("[GT06] CHUNK %dB from %s: %s", len(raw), peer, _hex_spaced(raw))
-        except Exception:
-            pass
-
-    checksum_mode, serial_bytes, payload_full = detect_checksum_and_serial(hdr, length, body_and_footer)
-    if not payload_full:
-        return
-
-    msg_type = payload_full[0]
-    payload = payload_full[1:]
-
-    # Logs RX/ACK (atuais)
-    logger.info("[GT06] RX type=0x%02X len=%d chk=%s serial=%s",
-                msg_type, length, checksum_mode, binascii.hexlify(serial_bytes).decode().upper() or "∅")
-
-    # ACK imediato
-    ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
-    writer.write(ack)
-    await writer.drain()
-    ack_hex = binascii.hexlify(ack).decode().upper()
-    logger.info("[GT06] TX_ACK=%s", ack_hex)
-
-    # Logs no estilo legado adicionais
-    if LOG_LEGACY:
-        cs_len = 1 if checksum_mode == "SUM8" else 2
-        # aproximação do body "útil": length - (type + serial + checksum)
-        body_len = max(0, length - (1 + len(serial_bytes or b"\x00\x00") + cs_len))
-        mode = "SUM" if checksum_mode == "SUM8" else "CRC16"
-        logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s", msg_type, body_len, cs_len, peer)
-        logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)", msg_type, _hex_spaced(ack), mode)
-
-        # STATUS extra
-        if msg_type == 0x13:
-            payload_wo_serial = payload[:-len(serial_bytes)] if (len(serial_bytes) and len(payload) >= len(serial_bytes)) else payload
-            logger.info("[GT06] STATUS(0x13) payload=%s serial=%s",
-                        _hex_spaced(payload_wo_serial) or "∅",
-                        binascii.hexlify(serial_bytes).decode().upper() or "∅")
-
-        # keepalive curtíssimo (alguns clones mandam 0x08 sem payload)
-        if msg_type == 0x08 and length <= (1 + cs_len):
-            logger.info("[GT06] SHORT(min) proto=0x08 TX_ACK=%s (mode=%s)", _hex_spaced(ack), mode)
-
-    # Opcional: validar checksum (já foi validado na detecção)
-    if VALIDATE_GT06_CRC:
-        pass
-
-    # Dispatch
-    if msg_type == 0x01:
-        await handle_login(payload, peer, state)
-        return
-
-    if msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
-        await handle_gps(payload, raw_hex, state)
-        return
-
-    if msg_type in (0x13, 0x08):  # STATUS/KEEPALIVE
-        return
-
-    logger.debug("[GT06] Tipo 0x%02X não tratado. payload=%s",
-                 msg_type, binascii.hexlify(payload).decode().upper())
-
-# ============================================================
-# Server
-# ============================================================
-async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+# ==========================
+# Handler TCP com autodetecção
+# ==========================
+async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
+    peer_ip = peer[0] if isinstance(peer, tuple) else None
+
+    buf = bytearray()
+    gt06_imei: Optional[str] = None  # IMEI completo por conexão
+
     logger.info("[TRV/GT06] Conexao de %s", peer)
-    state = ConnState()
+
     try:
         while True:
-            await process_frame(reader, writer, str(peer), state)
-    except (asyncio.IncompleteReadError, ConnectionResetError):
-        pass
+            chunk = await reader.read(1024)
+            if not chunk:
+                logger.info("[TRV/GT06] %s desconectou", peer)
+                break
+
+            logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, chunk.hex(" "))
+            buf += chunk
+
+            # 1) GT06 (binário, detectado por 0x78 0x78 ... 0D 0A)
+            while True:
+                i = buf.find(b"\x78\x78")
+                if i < 0 or len(buf) < i + 3:
+                    break
+
+                det = _loc_cs_style(buf, i)
+                if det is None:
+                    break  # aguarda mais bytes
+                end, cs_len = det
+
+                # recorta frame e zera do buffer
+                pkt = bytes(buf[i:end])
+                del buf[:end]
+                L = len(pkt)
+
+                # Short 6B frames: 78 78 01 <proto> 0D 0A (ex.: 0x08 HB, 0x57 keepalive vendor)
+                if L == 6 and pkt.startswith(b"\x78\x78\x01") and pkt.endswith(b"\x0d\x0a"):
+                    mproto = pkt[3]
+                    serial = b"\x00\x00"  # não há serial no frame curto
+                    ack = _ack_sum(mproto, serial) if cs_len == 1 else _ack_crc(mproto, serial)
+                    try:
+                        writer.write(ack); await writer.drain()
+                        logger.info("[GT06] SHORT(min) proto=0x%02X TX_ACK=%s (mode=%s)",
+                                    mproto, ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK SHORT proto=0x%02X: %s", mproto, e)
+                    continue
+
+                # body: tudo entre 'len' e o checksum (sem CRLF)
+                body = pkt[3 : L - (cs_len + 2)]
+                if len(body) < 3:
+                    logger.warning("[GT06] body muito curto: %s", pkt.hex(" "))
+                    continue
+
+                # (opcional) validar novamente baseado no body
+                if not _gt06_validate_by_body(pkt, cs_len):
+                    logger.warning("[GT06] checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
+                    continue
+
+                proto = body[0]
+                serial = body[-2:]
+                payload = body[1:-2]  # sem proto e sem serial
+
+                logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s",
+                            proto, len(body), cs_len, peer)
+
+                # 0x01 LOGIN
+                if proto == 0x01:
+                    imei = _gt06_extract_login_imei(body) or "UNKNOWN_GT06"
+
+                    # ensure_device com IMEI completo (quando disponível)
+                    try:
+                        if imei and imei.isdigit() and len(imei) == 15:
+                            await _ensure_device_safe(imei, "gt06", "gf22")
+                        else:
+                            await _ensure_device_safe("UNKNOWN_GT06", "gt06", "gf22")
+                    except Exception as e:
+                        logger.exception("[GT06] ensure_device (safe) falhou: %s", e)
+
+                    # guarda na sessão e caches
+                    gt06_imei = imei
+                    if peer_ip and imei and imei != "UNKNOWN_GT06":
+                        _gt06_peer_cache[peer_ip] = imei
+                        # popular cache last10->full
+                        _gt06_last10_to_full[imei[-10:]] = imei
+
+                    ack = _ack_sum(0x01, serial) if cs_len == 1 else _ack_crc(0x01, serial)
+                    try:
+                        writer.write(ack); await writer.drain()
+                        logger.info("[GT06] LOGIN imei=%s serial=%02X%02X TX_ACK=%s (mode=%s)",
+                                    imei, serial[0], serial[1], ack.hex(" "),
+                                    "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK LOGIN: %s", e)
+
+                # 0x08 HEARTBEAT (com serial/checksum)
+                elif proto == 0x08:
+                    ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] HEARTBEAT TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+
+                # 0x11/0x12/0x10 POSIÇÃO
+                elif proto in GT06_PROTOS_POS:
+                    core = body[:-2]  # remove serial do final do body
+                    parsed = _gt06_parse_position(core)
+                    if parsed:
+                        if len(parsed) == 6:
+                            lat, lon, spd_knots, crs, dt, valid = parsed
+                        else:
+                            lat, lon, spd_knots, crs, dt = parsed
+                            valid = True
+
+                        # escolha do IMEI para salvar
+                        imei_to_use = None
+                        # 1) sessão (login desta conexão)
+                        if gt06_imei and gt06_imei != "UNKNOWN_GT06":
+                            imei_to_use = gt06_imei
+                        # 2) cache por IP (se permitido e existir)
+                        if not imei_to_use and peer_ip:
+                            imei_to_use = _gt06_peer_cache.get(peer_ip)
+
+                        # 3) fallback: se por algum motivo só tivermos last10 (ex.: pré-populado por ENV)
+                        #    OBS: pacotes de posição GT06 não trazem IMEI; esse passo só ajuda
+                        #    se você já souber o last10 vindo de outra camada ou tiver populado manualmente.
+                        if imei_to_use and len(imei_to_use) == 10 and imei_to_use.isdigit():
+                            full = _gt06_last10_to_full.get(imei_to_use)
+                            if full:
+                                imei_to_use = full
+                                # atualiza caches
+                                gt06_imei = full
+                                _gt06_peer_cache[peer_ip] = full
+
+                        # 4) último recurso: se ainda assim não temos full, loga e usa o que tiver
+                        if not imei_to_use:
+                            # Tenta um chute por IP cache antigo
+                            if peer_ip and peer_ip in _gt06_peer_cache:
+                                imei_to_use = _gt06_peer_cache[peer_ip]
+                            else:
+                                imei_to_use = "UNKNOWN_GT06"
+                                logger.warning("[GT06] sem IMEI de sessão; salvando com UNKNOWN (recomenda-se forçar login 0x01)")
+
+                        try:
+                            await _save_position_safe(
+                                str(imei_to_use), lat, lon, dt, spd_knots, crs, valid, pkt.hex()
+                            )
+                            logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s (proto=0x%02X)",
+                                        imei_to_use, lat, lon, spd_knots, crs, dt.isoformat(), valid, proto)
+                        except Exception as e:
+                            logger.exception("[GT06] save_position falhou: %s", e)
+
+                    ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] POS TX_ACK=%s (proto=0x%02X mode=%s)",
+                                ack.hex(" "), proto, "SUM" if cs_len == 1 else "CRC")
+
+                # 0x13 STATUS (muitos GF22/360gps mandam isso periodicamente)
+                elif proto == 0x13:
+                    logger.info("[GT06] STATUS(0x13) payload=%s serial=%02X%02X",
+                                payload.hex(" "), serial[0], serial[1])
+                    ack = _ack_sum(0x13, serial) if cs_len == 1 else _ack_crc(0x13, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] 0x13 TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+
+                # 0x1A EXT/LBS (não tratado) – log detalhado e ACK
+                elif proto == 0x1A:
+                    logger.info("[GT06] EXT(0x1A) payload_len=%d payload=%s serial=%02X%02X",
+                                len(payload), payload.hex(" "), serial[0], serial[1])
+                    ack = _ack_sum(0x1A, serial) if cs_len == 1 else _ack_crc(0x1A, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] 0x1A TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+
+                else:
+                    # ACK para qualquer proto não tratado
+                    ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
+                    try:
+                        writer.write(ack); await writer.drain()
+                        logger.info("[GT06] Proto 0x%02X nao tratado -> TX_ACK=%s (serial=%02X%02X, mode=%s)",
+                                    proto, ack.hex(" "), serial[0], serial[1],
+                                    "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK proto=0x%02X: %s", proto, e)
+
+            # 2) TRV (texto, linhas terminadas em '#')
+            while True:
+                j = buf.find(b"#")
+                if j < 0:
+                    break
+                line = bytes(buf[: j + 1]).decode(errors="ignore").strip()
+                del buf[: j + 1]
+                if not line or not line.startswith("TRV"):
+                    continue
+
+                # Login TRV: TRVAP00<IMEI15>#
+                m = _trv_login_re.match(line)
+                if m:
+                    imei = m.group("imei")
+                    try:
+                        await _ensure_device_safe(imei, "trv", "gf22")
+                    except Exception as e:
+                        logger.exception("[TRV] ensure_device (safe) falhou: %s", e)
+
+                    if peer_ip:
+                        _peer_cache[peer_ip] = imei
+
+                    ack = _trv_ack_login().encode()
+                    writer.write(ack); await writer.drain()
+                    logger.info("[TRV] LOGIN imei=%s ack=%s", imei, ack.decode())
+                    continue
+
+                # Heartbeat TRVYP16
+                if line.startswith("TRVYP16"):
+                    ack = _trv_ack_heartbeat().encode()
+                    writer.write(ack); await writer.drain()
+                    logger.info("[TRV] HEARTBEAT ack=%s", ack.decode())
+                    continue
+
+                # Posição TRVYP14
+                if line.startswith("TRVYP14"):
+                    parsed = _trv_parse_yp14(line)
+                    if parsed:
+                        lat, lon, spd_knots, crs, fix_time, valid = parsed
+                        imei_for_trv: Optional[str] = None
+                        if ALLOW_IP_CACHE and peer_ip:
+                            imei_for_trv = _peer_cache.get(peer_ip)
+                        if imei_for_trv:
+                            try:
+                                await _save_position_safe(
+                                    imei_for_trv, lat, lon,
+                                    fix_time if valid else datetime.now(timezone.utc),
+                                    spd_knots, crs, valid, line
+                                )
+                                logger.info("[TRV] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s",
+                                            imei_for_trv, lat, lon, spd_knots, crs, fix_time.isoformat(), valid)
+                            except Exception as e:
+                                logger.exception("[TRV] save_position falhou: %s", e)
+                    continue
+
+                logger.info("[TRV] Linha nao tratada: %s", line)
+
     except Exception as e:
-        logger.exception("[GT06] erro: %s", e)
+        logger.exception("[TRV/GT06] Erro na conexao %s: %s", peer, e)
     finally:
         try:
             writer.close()
@@ -405,12 +606,8 @@ async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         except Exception:
             pass
 
-async def run(port: int = 5010):
-    server = await asyncio.start_server(gt06_server, "0.0.0.0", port)
-    addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-    logger.info(f"[TRV/GT06] Servidor escutando em {addrs}")
-    async with server:
-        await server.serve_forever()
-
-if __name__ == "__main__":
-    asyncio.run(run(int(os.getenv("TRV_PORT", "5010"))))
+async def start_trv_server():
+    server = await asyncio.start_server(_handle, "0.0.0.0", TRV_PORT)
+    sockets = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
+    logger.info("[TRV/GT06] Servidor escutando em %s", sockets)
+    return server
