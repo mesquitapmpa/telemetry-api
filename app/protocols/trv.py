@@ -293,6 +293,19 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 del buf[:end]
                 L = len(pkt)
 
+                # ---------- PATCH 1: heartbeat minimalista (sem serial/checksum) ----------
+                if L == 6 and pkt.startswith(b"\x78\x78\x01\x08") and pkt.endswith(b"\x0d\x0a"):
+                    serial = b"\x00\x00"  # não há serial; usamos 0000
+                    ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
+                    try:
+                        writer.write(ack); await writer.drain()
+                        logger.info("[GT06] HEARTBEAT(min) TX_ACK=%s (mode=%s)",
+                                    ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK HEARTBEAT(min): %s", e)
+                    continue
+                # --------------------------------------------------------------------------
+
                 # body: tudo entre 'len' e o checksum (sem CRLF)
                 body = pkt[3 : L - (cs_len + 2)]
                 if len(body) < 3:
@@ -317,9 +330,9 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         maybe_len = body[1]
                         rest = body[2:-2] if len(body) > 4 else b""
                         if maybe_len in (0x08, 0x0F) and len(rest) >= 1:
-                            imei_bcd = rest  # pegue o que houver (clones às vezes mandam menos que declaram)
+                            imei_bcd = rest  # pegue o que houver
                         else:
-                            imei_bcd = body[1:-2]  # variante “curta”: trate todo miolo como IMEI BCD
+                            imei_bcd = body[1:-2]  # variante “curta”
                         imei = _gt06_bcd_imei(imei_bcd) if imei_bcd else ""
                     if not imei:
                         imei = "UNKNOWN_GT06"
@@ -372,7 +385,16 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     logger.info("[GT06] POS TX_ACK=%s (mode=%s)", ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
                 else:
-                    logger.info("[GT06] Proto nao tratado: 0x%02X (cs_len=%d)", proto, cs_len)
+                    # ---------- PATCH 2: ACK para proto não tratado ----------
+                    ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
+                    try:
+                        writer.write(ack); await writer.drain()
+                        logger.info("[GT06] Proto 0x%02X nao tratado -> TX_ACK=%s (serial=%02X%02X, mode=%s)",
+                                    proto, ack.hex(" "), serial[0], serial[1],
+                                    "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK proto=0x%02X: %s", proto, e)
+                    # --------------------------------------------------------
 
             # 2) TRV (texto, linhas terminadas em '#')
             while True:
