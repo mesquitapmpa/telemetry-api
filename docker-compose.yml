@@ -35,6 +35,7 @@ services:
       ENABLE_GT06: "true"
       TRV_PORT: "5010"
       TRV_ALLOW_IP_CACHE: "true"   # opcional
+      GT06_LOG_LEGACY: "true"
     depends_on: [db]
     command: ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--proxy-headers","--forwarded-allow-ips","*"]
 
