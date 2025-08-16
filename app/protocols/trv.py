@@ -1,3 +1,4 @@
+# app/protocols/trv_gt06.py
 import asyncio
 import logging
 import os
@@ -24,9 +25,8 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ==========================
-# Utils de compatibilidade (sync/async e assinaturas)
+# Compat: funções sync/async e assinaturas flexíveis
 # ==========================
-
 async def _call_maybe_async(fn, *args, **kwargs):
     """Chama função sync/async; se TypeError por kwargs, tenta posicional."""
     try:
@@ -105,7 +105,6 @@ async def _save_position_safe(imei: str, lat: float, lon: float, dt: datetime,
 # ==========================
 # Utilitários – GT06
 # ==========================
-
 def _gt06_bcd_imei(b: bytes) -> str:
     """8 bytes BCD → 16 dígitos; retornar 15 dígitos IMEI sem zeros à esquerda."""
     s = ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
@@ -136,7 +135,7 @@ def _ack_crc(proto: int, serial: bytes) -> bytes:
     return b"\x78\x78" + body + crc.to_bytes(2, "big") + b"\x0D\x0A"
 
 def _ack_sum(proto: int, serial: bytes) -> bytes:
-    """ACK com checksum de 1 byte (soma): 78 78 05 <proto> <serial_hi> <serial_lo> <CS> 0D 0A"""
+    """ACK com checksum 1 byte (SUM): 78 78 05 <proto> <serial_hi> <serial_lo> <CS> 0D 0A"""
     if len(serial) != 2:
         serial = serial[:2].rjust(2, b"\x00")
     body = bytes([0x05, proto]) + serial
@@ -145,40 +144,46 @@ def _ack_sum(proto: int, serial: bytes) -> bytes:
 
 def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
     """
-    Localiza o frame pelo terminador 0D0A e infere cs_len (1 ou 2).
-    Retorna (end, cs_len) onde 'end' é o índice EXCLUSIVO do fim do frame.
+    Localiza o frame pelo terminador 0D 0A e determina cs_len por validação real.
+    Retorna (end, cs_len), onde end é EXCLUSIVO e cs_len ∈ {1,2}.
     """
     if len(buf) < i + 3:
         return None
-    # procura 0D0A depois de '78 78 len'
-    search_from = i + 4
-    tail = buf.find(b"\x0D\x0A", search_from)
+
+    # Procura 0D 0A depois de '78 78 len'
+    tail = buf.find(b"\x0D\x0A", i + 4)
     if tail < 0:
         return None
-    end = tail + 2
-    # bytes entre 'len' e checksum (sem CRLF)
-    between_len_and_tail = end - (i + 3) - 2
-    # default conservador (seu aparelho usa SUM=1B)
-    cs_len = 1
-    # heurística branda para aceitar CRC=2 quando plausível
-    for candidate in (2, 1):
-        body_len = between_len_and_tail - candidate
-        if body_len >= 3:  # ao menos proto(1)+serial(2)
-            cs_len = candidate
-            break
-    return (end, cs_len)
+    end = tail + 2  # índice EXCLUSIVO
 
-def _gt06_validate_by_body(pkt: bytes, end: int, cs_len: int) -> bool:
+    # Tenta CRC-16 (2 bytes): body_crc = bytes entre 'len' e checksum
+    if end - (i + 3) - 2 >= 2 + 3:  # ≥ proto(1)+serial(2) no body
+        body_crc = buf[i + 3 : end - (2 + 2)]
+        crc_field = int.from_bytes(buf[end - 2 - 2 : end - 2], "big")
+        if _crc16_x25(body_crc) == crc_field:
+            return (end, 2)
+
+    # Tenta SUM (1 byte)
+    if end - (i + 3) - 2 >= 1 + 3:
+        body_sum = buf[i + 3 : end - (1 + 2)]
+        sum_field = buf[end - 3]
+        if (_sum_cs(body_sum) & 0xFF) == sum_field:
+            return (end, 1)
+
+    # Fallback seguro: assume SUM (a maioria dos clones usa 1B)
+    return (end, 1)
+
+def _gt06_validate_by_body(pkt: bytes, cs_len: int) -> bool:
     """Valida checksum contra o 'body' (entre len e checksum), sem depender do len declarativo."""
     if not VALIDATE_GT06_CRC:
         return True
-    # body: bytes entre 'len' e o checksum
-    body = pkt[3 : end - (cs_len + 2)]
+    L = len(pkt)
+    body = pkt[3 : L - (cs_len + 2)]
     if cs_len == 2:
-        got = int.from_bytes(pkt[end - 2 - cs_len : end - 2], "big")
+        got = int.from_bytes(pkt[L - (2 + 2) : L - 2], "big")
         return got == _crc16_x25(body)
     else:
-        got = pkt[end - 2 - cs_len]
+        got = pkt[L - 3]
         return got == (_sum_cs(body) & 0xFF)
 
 def _gt06_parse_position(core: bytes):
@@ -192,9 +197,7 @@ def _gt06_parse_position(core: bytes):
       [16]   speed_kmh
       [17:19] course/status (10 bits de rumo)
     """
-    if len(core) < 19:
-        return None
-    if core[0] not in (0x12, 0x10):
+    if len(core) < 19 or core[0] not in (0x12, 0x10):
         return None
     yy, mm, dd, hh, mi, ss = core[1:7]
     try:
@@ -212,7 +215,6 @@ def _gt06_parse_position(core: bytes):
 # ==========================
 # Utilitários – TRV (GF22)
 # ==========================
-
 _trv_login_re = re.compile(r"^TRVAP00(?P<imei>\d{15})#$")
 
 def _trv_ack_login() -> str:
@@ -255,7 +257,6 @@ _gt06_peer_cache: dict[str, str] = {}  # GT06 : IP → IMEI
 # ==========================
 # Handler TCP com autodetecção
 # ==========================
-
 async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
     peer_ip = peer[0] if isinstance(peer, tuple) else None
@@ -287,16 +288,19 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     break  # aguarda mais bytes
                 end, cs_len = det
 
+                # recorta frame e zera do buffer
                 pkt = bytes(buf[i:end])
                 del buf[:end]
+                L = len(pkt)
 
-                # body: tudo entre 'len' e o checksum
-                body = pkt[3 : end - (cs_len + 2)]
+                # body: tudo entre 'len' e o checksum (sem CRLF)
+                body = pkt[3 : L - (cs_len + 2)]
                 if len(body) < 3:
                     logger.warning("[GT06] body muito curto: %s", pkt.hex(" "))
                     continue
 
-                if not _gt06_validate_by_body(pkt, end, cs_len):
+                # (opcional) validar novamente baseado no body
+                if not _gt06_validate_by_body(pkt, cs_len):
                     logger.warning("[GT06] checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
                     continue
 
@@ -311,15 +315,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     imei = ""
                     if len(body) >= 2:
                         maybe_len = body[1]
-                        # bytes entre o suposto 'len' e o serial
                         rest = body[2:-2] if len(body) > 4 else b""
                         if maybe_len in (0x08, 0x0F) and len(rest) >= 1:
-                            imei_bcd = rest  # pegue o que houver (alguns clones enviam menos do que declaram)
+                            imei_bcd = rest  # pegue o que houver (clones às vezes mandam menos que declaram)
                         else:
-                            # Variante curta: trate todo miolo como IMEI BCD
-                            imei_bcd = body[1:-2]
+                            imei_bcd = body[1:-2]  # variante “curta”: trate todo miolo como IMEI BCD
                         imei = _gt06_bcd_imei(imei_bcd) if imei_bcd else ""
-
                     if not imei:
                         imei = "UNKNOWN_GT06"
 
@@ -329,6 +330,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     except Exception as e:
                         logger.exception("[GT06] ensure_device (safe) falhou: %s", e)
 
+                    gt06_imei = imei
                     if peer_ip:
                         _gt06_peer_cache[peer_ip] = imei
 
