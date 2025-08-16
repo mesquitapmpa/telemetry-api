@@ -6,8 +6,14 @@ import inspect
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Any, Dict
 
-# Ajuste conforme seu projeto
+# Usecases existentes no seu projeto
 from app.usecases.save_position import ensure_device, save_position
+
+# Novo usecase (arquivo abaixo)
+from app.usecases.device_identifiers import (
+    upsert_device_identifier_by_device_id,
+    find_device_by_last10,
+)
 
 # ==========================
 # Configurações
@@ -40,7 +46,10 @@ async def _call_maybe_async(fn, *args, **kwargs):
     return res
 
 async def _ensure_device_safe(imei: str, protocol: str, model: Optional[str] = None):
-    """Tenta ensure_device posicional e, se falhar, nomeado. Nunca bloqueia o fluxo."""
+    """
+    Tenta ensure_device posicional e, se falhar, nomeado.
+    Retorna o que ensure_device retornar (idealmente {'id': <uuid>, 'imei': <str>, ...}).
+    """
     try:
         return await _call_maybe_async(ensure_device, imei, protocol, model)
     except Exception as e1:
@@ -281,6 +290,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
     buf = bytearray()
     gt06_imei: Optional[str] = None
+    gt06_device_id: Optional[str] = None  # ID textual (uuid/char(36)) da tabela devices
 
     logger.info("[TRV/GT06] Conexao de %s", peer)
 
@@ -294,7 +304,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, chunk.hex(" "))
             buf += chunk
 
-            # 1) GT06 (binário, detectado por 0x78 0x78 ... 0D 0A)
+            # 1) GT06 (binário)
             while True:
                 i = buf.find(b"\x78\x78")
                 if i < 0 or len(buf) < i + 3:
@@ -310,10 +320,10 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 del buf[:end]
                 L = len(pkt)
 
-                # Short 6B frames: 78 78 01 <proto> 0D 0A (ex.: 0x08 HB, 0x57 keepalive vendor)
+                # Short 6B frames (ex.: 0x08 HB min)
                 if L == 6 and pkt.startswith(b"\x78\x78\x01") and pkt.endswith(b"\x0d\x0a"):
                     mproto = pkt[3]
-                    serial = b"\x00\x00"  # não há serial no frame curto
+                    serial = b"\x00\x00"
                     ack = _ack_sum(mproto, serial) if cs_len == 1 else _ack_crc(mproto, serial)
                     try:
                         writer.write(ack); await writer.drain()
@@ -323,13 +333,11 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         logger.exception("[GT06] Falha ao enviar ACK SHORT proto=0x%02X: %s", mproto, e)
                     continue
 
-                # body: tudo entre 'len' e o checksum (sem CRLF)
                 body = pkt[3 : L - (cs_len + 2)]
                 if len(body) < 3:
                     logger.warning("[GT06] body muito curto: %s", pkt.hex(" "))
                     continue
 
-                # (opcional) validar novamente baseado no body
                 if not _gt06_validate_by_body(pkt, cs_len):
                     logger.warning("[GT06] checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
                     continue
@@ -344,25 +352,38 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 # 0x01 LOGIN
                 if proto == 0x01:
                     imei = ""
+                    imei_bcd = b""
                     if len(body) >= 2:
                         maybe_len = body[1]
                         rest = body[2:-2] if len(body) > 4 else b""
-                        if maybe_len in (0x08, 0x0F) and len(rest) >= 1:
-                            imei_bcd = rest
+                        if maybe_len in (0x08, 0x0F) and len(rest) >= maybe_len:
+                            imei_bcd = rest[:maybe_len]
                         else:
                             imei_bcd = body[1:-2]
                         imei = _gt06_bcd_imei(imei_bcd) if imei_bcd else ""
                     if not imei:
                         imei = "UNKNOWN_GT06"
 
-                    try:
-                        await _ensure_device_safe(imei, "gt06", "gf22")
-                    except Exception as e:
-                        logger.exception("[GT06] ensure_device (safe) falhou: %s", e)
-
+                    # garante device e captura id/imei consolidados
+                    device = await _ensure_device_safe(imei, "gt06", "gf22")
                     gt06_imei = imei
+                    if isinstance(device, dict):
+                        gt06_device_id = device.get("id") or device.get("device_id")
                     if peer_ip:
                         _gt06_peer_cache[peer_ip] = imei
+
+                    # registra alias last10 -> device_id
+                    if gt06_device_id and imei and imei.isdigit():
+                        last10 = imei[-10:]
+                        try:
+                            await upsert_device_identifier_by_device_id(
+                                device_id=str(gt06_device_id),
+                                id_type="gt06_last10",
+                                id_value=last10,
+                            )
+                            logger.info("[GT06] alias registrado id_type=gt06_last10 id_value=%s device_id=%s", last10, gt06_device_id)
+                        except Exception as e:
+                            logger.exception("[GT06] upsert alias last10 falhou: %s", e)
 
                     ack = _ack_sum(0x01, serial) if cs_len == 1 else _ack_crc(0x01, serial)
                     try:
@@ -373,7 +394,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK LOGIN: %s", e)
 
-                # 0x08 HEARTBEAT (com serial/checksum)
+                # 0x08 HEARTBEAT
                 elif proto == 0x08:
                     ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
                     writer.write(ack); await writer.drain()
@@ -382,15 +403,18 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
                 # 0x11/0x12/0x10 POSIÇÃO
                 elif proto in GT06_PROTOS_POS:
-                    core = body[:-2]  # remove serial do final do body
+                    core = body[:-2]
                     parsed = _gt06_parse_position(core)
                     if parsed:
-                        if len(parsed) == 6:
-                            lat, lon, spd_knots, crs, dt, valid = parsed
-                        else:
-                            lat, lon, spd_knots, crs, dt = parsed
-                            valid = True
+                        lat, lon, spd_knots, crs, dt, valid = parsed
                         imei_to_use = gt06_imei or (peer_ip and _gt06_peer_cache.get(peer_ip))
+
+                        # (Opcional) fallback por last10 via view se você decidir usar isso:
+                        # if not imei_to_use and SOME_WAY_TO_EXTRACT_LAST10:
+                        #     found = await find_device_by_last10(last10)
+                        #     if found and found.get("imei"):
+                        #         imei_to_use = found["imei"]
+
                         if imei_to_use:
                             try:
                                 await _save_position_safe(
@@ -406,7 +430,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     logger.info("[GT06] POS TX_ACK=%s (proto=0x%02X mode=%s)",
                                 ack.hex(" "), proto, "SUM" if cs_len == 1 else "CRC")
 
-                # 0x13 STATUS (muitos GF22/360gps mandam isso periodicamente)
+                # 0x13 STATUS
                 elif proto == 0x13:
                     logger.info("[GT06] STATUS(0x13) payload=%s serial=%02X%02X",
                                 payload.hex(" "), serial[0], serial[1])
@@ -415,7 +439,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     logger.info("[GT06] 0x13 TX_ACK=%s (mode=%s)",
                                 ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
-                # 0x1A EXT/LBS (não tratado) – log detalhado e ACK
+                # 0x1A EXT/LBS
                 elif proto == 0x1A:
                     logger.info("[GT06] EXT(0x1A) payload_len=%d payload=%s serial=%02X%02X",
                                 len(payload), payload.hex(" "), serial[0], serial[1])
@@ -425,7 +449,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                                 ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
                 else:
-                    # ACK para qualquer proto não tratado
                     ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
                     try:
                         writer.write(ack); await writer.drain()
@@ -435,7 +458,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK proto=0x%02X: %s", proto, e)
 
-            # 2) TRV (texto, linhas terminadas em '#')
+            # 2) TRV (texto)
             while True:
                 j = buf.find(b"#")
                 if j < 0:
@@ -449,10 +472,20 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 m = _trv_login_re.match(line)
                 if m:
                     imei = m.group("imei")
-                    try:
-                        await _ensure_device_safe(imei, "trv", "gf22")
-                    except Exception as e:
-                        logger.exception("[TRV] ensure_device (safe) falhou: %s", e)
+                    device = await _ensure_device_safe(imei, "trv", "gf22")
+                    if isinstance(device, dict):
+                        dev_id = device.get("id") or device.get("device_id")
+                        if dev_id and imei and imei.isdigit():
+                            last10 = imei[-10:]
+                            try:
+                                await upsert_device_identifier_by_device_id(
+                                    device_id=str(dev_id),
+                                    id_type="gt06_last10",
+                                    id_value=last10,
+                                )
+                                logger.info("[TRV] alias registrado id_type=gt06_last10 id_value=%s device_id=%s", last10, dev_id)
+                            except Exception as e:
+                                logger.exception("[TRV] upsert alias last10 falhou: %s", e)
 
                     if peer_ip:
                         _peer_cache[peer_ip] = imei
