@@ -14,6 +14,13 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
+LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "false").lower() == "true"  # <- habilita logs no estilo antigo
+
+# ============================================================
+# Helpers de log legado
+# ============================================================
+def _hex_spaced(b: bytes) -> str:
+    return " ".join(f"{x:02X}" for x in b)
 
 # ============================================================
 # Checksums
@@ -153,6 +160,7 @@ class ConnState:
 # Handlers
 # ============================================================
 async def handle_login(payload: bytes, peer: str, state: ConnState):
+    # LOGIN curto/long: geralmente 8 bytes BCD IMEI no início
     imei = decode_bcd_imei(payload[:8]) if len(payload) >= 8 else ""
     state.imei_seen = imei or state.imei_seen
 
@@ -160,9 +168,13 @@ async def handle_login(payload: bytes, peer: str, state: ConnState):
         logger.warning(f"[GT06] LOGIN sem IMEI decodificável (peer={peer})")
         return
 
-    # 🔒 Reforço: rejeita IMEI inválido/curto antes de tentar garantir
+    # 🔒 Rejeita IMEI inválido/curto antes de garantir
     if not imei.isdigit() or len(imei) < 15:
-        logger.warning(f"[GT06] LOGIN rejeitado: IMEI inválido/curto (len={len(imei)}). Sessão permanecerá sem device. peer={peer}")
+        msg = "[GT06] LOGIN (curto) — IMEI inválido/curto; sessão sem device."
+        if LOG_LEGACY:
+            logger.info(msg)
+        else:
+            logger.warning(msg)
         return
 
     device = await ensure_device_canonical("gt06", imei)
@@ -170,7 +182,7 @@ async def handle_login(payload: bytes, peer: str, state: ConnState):
         state.device = {"id": device.get("id"), "imei": device.get("imei")}
         logger.info(f"[GT06] LOGIN OK: device_id={state.device['id']} imei={state.device['imei']} peer={peer}")
     else:
-        logger.warning(f"[GT06] LOGIN sem device canônico (IMEI válido) — verifique ensure_device(). peer={peer}")
+        logger.warning(f"[GT06] LOGIN sem device canônico (IMEI válido). peer={peer}")
 
 async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
     gps = parse_gps_basic(payload)
@@ -180,17 +192,14 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
 
     # Garantir device canônico na sessão; se não houver (ex.: pulou login), tente via IMEI visto
     if not state.device:
-        if state.imei_seen:
-            dev = await ensure_device_canonical("gt06", state.imei_seen)
-            if dev:
-                state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
-
-    # Garantir device canônico na sessão; se não houver (ex.: pulou login), tente via IMEI visto
-    if not state.device:
         if state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) >= 15:
             dev = await ensure_device_canonical("gt06", state.imei_seen)
             if dev:
                 state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
+
+    if not state.device:
+        logger.warning("[GT06] Sem device canônico; descartando posição para evitar IMEI curto.")
+        return
 
     # Salvar por device_id (evita criação por IMEI dentro do save_position)
     payload_to_save = {
@@ -236,16 +245,47 @@ async def process_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     raw = hdr + bytes([length]) + body_and_footer
     raw_hex = binascii.hexlify(raw).decode().upper()
 
+    # Log estilo legado do pacote bruto (CHUNK ...)
+    if LOG_LEGACY:
+        try:
+            logger.info(f"[GT06] CHUNK {len(raw)}B from {peer}: {_hex_spaced(raw)}")
+        except Exception:
+            pass
+
     checksum_mode, serial_bytes, payload_full = detect_checksum_and_serial(hdr, length, body_and_footer)
     msg_type = payload_full[0] if payload_full else 0x00
     payload = payload_full[1:] if len(payload_full) > 1 else b""
+
+    # Log estilo legado RX proto=... body_len=... cs_len=...
+    if LOG_LEGACY:
+        cs_len = 1 if checksum_mode == "SUM8" else 2
+        body_len = max(0, length - (1 + cs_len + len(serial_bytes)))  # aprox. do corpo
+        logger.info(f"[GT06] RX proto=0x{msg_type:02X} body_len={body_len} cs_len={cs_len} from={peer}")
 
     # ACK imediato
     ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
     writer.write(ack)
     await writer.drain()
-    logger.info(f"[GT06] RX type=0x{msg_type:02X} len={length} checksum={checksum_mode} serial={binascii.hexlify(serial_bytes).decode().upper() or '∅'}")
-    logger.info(f"[GT06] TX_ACK={binascii.hexlify(ack).decode().upper()}")
+
+    # Logs atuais
+    logger.info(f"[GT06] RX type=0x{msg_type:02X} len={length} chk={checksum_mode} serial={binascii.hexlify(serial_bytes).decode().upper() or '∅'}")
+    ack_hex = binascii.hexlify(ack).decode().upper()
+    logger.info(f"[GT06] TX_ACK={ack_hex}")
+
+    # Logs no estilo legado adicionais
+    if LOG_LEGACY:
+        mode = "SUM" if checksum_mode == "SUM8" else "CRC16"
+        logger.info(f"[GT06] 0x{msg_type:02X} TX_ACK={_hex_spaced(ack)} (mode={mode})")
+
+        if msg_type == 0x13:
+            payload_wo_serial = payload[:-len(serial_bytes)] if (len(serial_bytes) and len(payload) >= len(serial_bytes)) else payload
+            logger.info(f"[GT06] STATUS(0x13) payload={_hex_spaced(payload_wo_serial) or '∅'} serial={binascii.hexlify(serial_bytes).decode().upper() or '∅'}")
+
+        if msg_type == 0x08:
+            # Heurística de keepalive mínimo
+            cs_len = 1 if checksum_mode == "SUM8" else 2
+            if length <= (1 + cs_len):
+                logger.info(f"[GT06] SHORT(min) proto=0x08 TX_ACK={_hex_spaced(ack)} (mode={mode})")
 
     # Opcional: validar checksum (quando habilitado)
     if VALIDATE_GT06_CRC:
