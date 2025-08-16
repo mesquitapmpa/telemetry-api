@@ -18,9 +18,9 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
-# Flags de depuração / validação
+# Flags
 VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
-LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "false").lower() == "true"  # logs estilo antigo
+LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "true").lower() == "true"  # habilita CHUNK/RX/TX estilo antigo
 
 # ============================================================
 # Helpers de log legado
@@ -34,18 +34,14 @@ def _hex_spaced(b: bytes) -> str:
 def crc16_x25(data: bytes) -> int:
     """
     CRC-16/X25 (refletido), init=0xFFFF, xorout=0xFFFF.
-    Retorna inteiro já no 'byte order' esperado para empacotar em big-endian (>H).
+    Retorna inteiro pronto para empacotar como big-endian (>H).
     """
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if (crc & 1) != 0:
-                crc = (crc >> 1) ^ 0x8408
-            else:
-                crc >>= 1
+            crc = (crc >> 1) ^ 0x8408 if (crc & 1) else (crc >> 1)
     crc = ~crc & 0xFFFF
-    # inversão para combinar com muitos firmwares GT06
     return ((crc & 0xFF) << 8) | (crc >> 8)
 
 def sum8(data: bytes) -> int:
@@ -56,32 +52,30 @@ def sum8(data: bytes) -> int:
 # ============================================================
 def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
     """
-    Monta ACK com o mesmo header (0x7878/0x7979) e modo de checksum detectado.
+    Monta ACK com o mesmo header (0x7878/0x7979) e modo detectado.
     - CRC16: len = type(1) + serial(2) + CRC(2)
     - SUM8 : len = type(1) + serial(2) + SUM(1)
-    - TRUNC: usa SUM8 com serial zerado (tolerante)
+    - TRUNC: responde como SUM8 com serial=0000 (tolerante)
     """
     hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
 
     # normaliza serial para 2 bytes
-    serial = serial_bytes or b""
-    if len(serial) == 0:
-        serial = b"\x00\x00"
-    elif len(serial) == 1:
+    serial = serial_bytes or b"\x00\x00"
+    if len(serial) == 1:
         serial = b"\x00" + serial
-    else:
+    elif len(serial) >= 2:
         serial = serial[-2:]
 
     body_wo_chk = bytes([msg_type]) + serial
 
     if checksum_mode == "CRC16":
-        length = 1 + len(serial) + 2
+        length = 1 + 2 + 2
         pkt_wo_crc = hdr + bytes([length]) + body_wo_chk
         crc = crc16_x25(pkt_wo_crc[2:])
         return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
 
-    # SUM8 ou TRUNC -> responde com SUM8
-    length = 1 + len(serial) + 1
+    # SUM8 ou TRUNC → responde com SUM8
+    length = 1 + 2 + 1
     pkt_wo_sum = hdr + bytes([length]) + body_wo_chk
     cs = sum8(pkt_wo_sum[2:])
     return pkt_wo_sum + bytes([cs]) + b"\x0D\x0A"
@@ -100,22 +94,21 @@ def parse_datetime_bcd(dt6: bytes) -> datetime:
         return datetime.now(timezone.utc)
 
 def decode_bcd_imei(imei_bcd: bytes) -> str:
-    # 8 bytes BCD => 16 dígitos; removemos zeros à esquerda e mantemos 15 dígitos
     s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)
     return s.lstrip('0')[:15]
 
 def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     """
     payload do LOGIN (sem o byte type=0x01).
-      - 0x08 + 8 bytes BCD
-      - 0x0F + 15 bytes ASCII
-      - fallback: varre janelas de 8 bytes plausíveis
+    - 0x08 + 8 bytes BCD
+    - 0x0F + 15 bytes ASCII
+    - fallback: varre 8 bytes plausíveis
     """
     if not payload:
         return None
 
-    # ASCII (0x0F + 15)
-    if payload[0:1] == b"\x0F" and len(payload) >= 16:
+    # ASCII 0x0F
+    if payload[:1] == b"\x0F" and len(payload) >= 16:
         try:
             s = payload[1:16].decode()
             if s.isdigit() and len(s) == 15:
@@ -123,13 +116,13 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # BCD (0x08 + 8)
-    if payload[0:1] == b"\x08" and len(payload) >= 9:
+    # BCD 0x08
+    if payload[:1] == b"\x08" and len(payload) >= 9:
         s = decode_bcd_imei(payload[1:9])
         if s.isdigit() and len(s) == 15:
             return s
 
-    # Fallback: varrer janelas de 8 bytes
+    # fallback
     for i in range(0, max(0, len(payload) - 7)):
         s = decode_bcd_imei(payload[i:i+8])
         if s.isdigit() and len(s) == 15:
@@ -138,18 +131,15 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
 
 def parse_gps_basic(payload: bytes) -> Optional[dict]:
     """
-    Mensagem básica de posição (0x10/0x11/0x12):
+    Posição (0x10/0x11/0x12):
       [time6][flags1][lat4][lon4][speed1][course2]
-    - lat/lon sem sinal; sinais nos bits do campo course:
-      bit11 => GPS fix
-      bit12 => 1=West (lon negativa)
-      bit13 => 1=South (lat negativa)
+    - sinais: bit12=West (lon-), bit13=South (lat-)
+    - validade: bit11=GPS fix
     """
     if len(payload) < 6+1+4+4+1+2:
         return None
 
     dt = parse_datetime_bcd(payload[0:6])
-
     lat_raw = int.from_bytes(payload[7:11], "big", signed=False)
     lon_raw = int.from_bytes(payload[11:15], "big", signed=False)
     speed_kmh = float(payload[15]) * 1.852
@@ -178,50 +168,6 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
     }
 
 # ============================================================
-# Deframer / detector de checksum e serial
-# ============================================================
-def detect_checksum_and_serial(hdr: bytes, length: int, body_and_footer: bytes) -> Tuple[str, bytes, bytes]:
-    """
-    Retorna (checksum_mode, serial_bytes, payload_full)
-    payload_full = [type(1)] + [payload ... (+ possivel serial antes do checksum)]
-    checksum_mode ∈ {"CRC16", "SUM8", "TRUNC"}
-    """
-    # Esperamos ... [type + payload + (checksum?) + 0D 0A]
-    if len(body_and_footer) < 1 + 2:
-        return ("TRUNC", b"", b"")
-    if body_and_footer[-2:] != b"\x0D\x0A":
-        return ("TRUNC", b"", b"")
-
-    core = body_and_footer[:-2]  # remove CRLF
-    if len(core) < 1:
-        return ("TRUNC", b"", b"")
-
-    msg_type_b = core[:1]
-    rest = core[1:]
-
-    # 1) Tenta CRC16 (últimos 2 bytes)
-    if len(rest) >= 2:
-        crc_recv = struct.unpack(">H", rest[-2:])[0]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-2]
-        crc_calc = crc16_x25(candidate[2:])
-        if crc_calc == crc_recv:
-            serial = rest[-4:-2] if len(rest) >= 4 else b"\x00\x00"
-            payload_full = msg_type_b + rest[:-2]  # inclui serial no final, se houver
-            return ("CRC16", serial, payload_full)
-
-    # 2) Tenta SUM-8 (último byte)
-    if len(rest) >= 1:
-        cs_recv = rest[-1]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-1]
-        if sum8(candidate[2:]) == cs_recv:
-            serial = rest[-3:-1] if len(rest) >= 3 else b"\x00\x00"
-            payload_full = msg_type_b + rest[:-1]
-            return ("SUM8", serial, payload_full)
-
-    # 3) TRUNC (sem checksum válido) — ainda assim seguimos em frente
-    return ("TRUNC", b"", msg_type_b + rest)
-
-# ============================================================
 # Sessão por conexão
 # ============================================================
 class ConnState:
@@ -231,45 +177,28 @@ class ConnState:
         self.imei_seen: Optional[str] = None
 
 def _device_as_dict(dev: Any) -> Optional[Dict[str, Any]]:
-    """
-    Converte o retorno de ensure_device_canonical em dict padronizado.
-    Aceita objetos com atributos ('id', 'imei') ou dicts.
-    """
     if dev is None:
         return None
     if isinstance(dev, dict):
-        dev_id = dev.get("id")
-        dev_imei = dev.get("imei")
-        if dev_id and dev_imei:
-            return {"id": dev_id, "imei": dev_imei}
-        return None
-    dev_id = getattr(dev, "id", None)
-    dev_imei = getattr(dev, "imei", None)
-    if dev_id and dev_imei:
-        return {"id": dev_id, "imei": dev_imei}
-    return None
+        did = dev.get("id"); imei = dev.get("imei")
+        return {"id": did, "imei": imei} if did and imei else None
+    did = getattr(dev, "id", None); imei = getattr(dev, "imei", None)
+    return {"id": did, "imei": imei} if did and imei else None
 
 # ============================================================
-# Adaptador de compatibilidade para save_position
+# Adaptador compatível com diferentes assinaturas de save_position
 # ============================================================
 def _normalize_param_name(name: str) -> str:
     n = name.lower()
     aliases = {
-        "imei": "imei",
-        "device_id": "device_id",
-
+        "imei": "imei", "device_id": "device_id",
         "latitude": "lat", "lat": "lat",
         "longitude": "lon", "lng": "lon", "long": "lon",
-
         "fix_time": "fix_time", "fixtime": "fix_time", "time": "fix_time", "dt": "fix_time",
-
         "speed_knots": "speed_knots", "speed": "speed_knots", "spd": "speed_knots",
         "speed_kmh": "speed_kmh",
-
         "course": "course_deg", "course_deg": "course_deg", "heading": "course_deg",
-
-        "valid": "valid",
-        "raw": "raw",
+        "valid": "valid", "raw": "raw",
     }
     return aliases.get(n, n)
 
@@ -280,11 +209,6 @@ async def _call_maybe_async(fn, *args, **kwargs):
     return res
 
 async def _save_position_compat(state_device: Dict[str, Any], gps: Dict[str, Any], raw_hex: str):
-    """
-    Chama save_position aceitando:
-      - kwargs (lat/lon/fix_time/...) com 'device_id' ou 'imei'
-      - forma posicional clássica: (imei, lat, lon, fix_time, speed_knots, course_deg, valid, raw)
-    """
     imei = state_device.get("imei")
     dev_id = state_device.get("id")
 
@@ -296,12 +220,11 @@ async def _save_position_compat(state_device: Dict[str, Any], gps: Dict[str, Any
     course_deg = float(gps["course"])
     valid = bool(gps["valid"])
 
-    # 1) Tenta por nomes (inspecionando a assinatura)
+    # 1) kwargs (descobrindo assinatura)
     try:
         sig = inspect.signature(save_position)
-        params = list(sig.parameters.keys())
         kw = {}
-        for p in params:
+        for p in sig.parameters.keys():
             pn = _normalize_param_name(p)
             if pn == "device_id" and dev_id:
                 kw[p] = dev_id
@@ -328,18 +251,174 @@ async def _save_position_compat(state_device: Dict[str, Any], gps: Dict[str, Any
     except Exception:
         pass
 
-    # 2) Fallback posicional clássico
+    # 2) posicional clássico
     return await _call_maybe_async(
         save_position,
-        imei,        # 1º
-        lat,         # 2º
-        lon,         # 3º
-        fix_time,    # 4º
-        speed_knots, # 5º
-        course_deg,  # 6º
-        valid,       # 7º
-        raw_hex,     # 8º
+        imei, lat, lon, fix_time, speed_knots, course_deg, valid, raw_hex
     )
+
+# ============================================================
+# Deframer por buffer
+# ============================================================
+def _find_next_header(buf: bytearray, start: int = 0) -> Tuple[int, Optional[int]]:
+    """
+    Retorna (idx_header, header_value) onde header_value ∈ {0x7878, 0x7979}.
+    Se não achar, ( -1, None ).
+    """
+    i = buf.find(b"\x78\x78", start)
+    j = buf.find(b"\x79\x79", start)
+    if i == -1 and j == -1:
+        return -1, None
+    if i == -1:
+        return j, 0x7979
+    if j == -1:
+        return i, 0x7878
+    # pega a primeira ocorrência
+    return (i, 0x7878) if i < j else (j, 0x7979)
+
+def _detect_checksum_from_raw(raw: bytes) -> Tuple[str, bytes, bytes]:
+    """
+    raw = [hdr2][len1][type+payload(+serial?)(+chk?)] [0D 0A]
+    Retorna (checksum_mode, serial_bytes, payload_full = [type]+payload[+serial?]).
+    """
+    if len(raw) < 5:
+        return ("TRUNC", b"", b"")
+    hdr = raw[:2]
+    length = raw[2]
+    content = raw[3:-2]  # entre len e CRLF
+    if len(content) < 1:
+        return ("TRUNC", b"", b"")
+
+    msg_type_b = content[:1]
+    rest = content[1:]
+
+    # Tenta CRC16
+    if len(rest) >= 2:
+        crc_recv = struct.unpack(">H", rest[-2:])[0]
+        candidate = hdr + bytes([length]) + msg_type_b + rest[:-2]
+        if crc16_x25(candidate[2:]) == crc_recv:
+            serial = rest[-4:-2] if len(rest) >= 4 else b"\x00\x00"
+            return ("CRC16", serial, msg_type_b + rest[:-2])
+
+    # Tenta SUM8
+    if len(rest) >= 1:
+        sum_recv = rest[-1]
+        candidate = hdr + bytes([length]) + msg_type_b + rest[:-1]
+        if (sum8(candidate[2:]) & 0xFF) == sum_recv:
+            serial = rest[-3:-1] if len(rest) >= 3 else b"\x00\x00"
+            return ("SUM8", serial, msg_type_b + rest[:-1])
+
+    # TRUNC
+    return ("TRUNC", b"", msg_type_b + rest)
+
+async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
+    buf = bytearray()
+    while True:
+        chunk = await reader.read(4096)
+        if not chunk:
+            return
+        buf += chunk
+
+        if LOG_LEGACY:
+            try:
+                logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, _hex_spaced(chunk))
+            except Exception:
+                pass
+
+        # consome todos os frames disponíveis no buffer
+        while True:
+            # procura header
+            i, header_val = _find_next_header(buf, 0)
+            if i < 0:
+                # nada de header — limpa lixo no início
+                if len(buf) > 4096:
+                    del buf[:-2]
+                break
+
+            # precisa de pelo menos header+len+CRLF
+            if len(buf) < i + 3:
+                break
+
+            hdr = bytes(buf[i:i+2])
+            length = buf[i+2]
+
+            # estratégia 1: usar len declarado + CRLF
+            end_decl = i + 2 + 1 + length + 2  # hdr2 + len1 + body(len) + crlf2
+            # se não temos tudo ainda, espera mais
+            if len(buf) < end_decl:
+                # estratégia 2: procurar CRLF mais próximo para casos truncados/estranhos
+                tail_search_from = i + 3  # depois do len
+                tail_pos = buf.find(b"\x0D\x0A", tail_search_from)
+                if tail_pos < 0:
+                    break  # aguarda mais
+                # temos CRLF antes do end_decl -> frame TRUNC/curto
+                end = tail_pos + 2
+            else:
+                # checa se realmente termina com CRLF onde deveria
+                if buf[end_decl-2:end_decl] == b"\x0D\x0A":
+                    end = end_decl
+                else:
+                    # len parece maior do que o real — tenta CRLF adiante
+                    tail_pos = buf.find(b"\x0D\x0A", i + 3)
+                    if tail_pos < 0:
+                        break
+                    end = tail_pos + 2
+
+            raw = bytes(buf[i:end])
+            # corta do buffer tudo até o fim do frame
+            del buf[:end]
+
+            # valida mínimo (header+len+type+crlf)
+            if len(raw) < 7 or raw[:2] not in (b"\x78\x78", b"\x79\x79") or raw[-2:] != b"\x0D\x0A":
+                continue
+
+            # detecta checksum/serial
+            checksum_mode, serial_bytes, payload_full = _detect_checksum_from_raw(raw)
+            if checksum_mode == "TRUNC" and VALIDATE_GT06_CRC:
+                # se quiser, descarte frames truncados quando validação estrita
+                pass
+
+            # tipo e payload
+            if not payload_full:
+                continue
+            msg_type = payload_full[0]
+            payload = payload_full[1:]
+
+            # logs RX
+            length_byte = raw[2]
+            logger.info("[GT06] RX type=0x%02X len_byte=%d chk=%s serial=%s",
+                        msg_type, length_byte, checksum_mode,
+                        binascii.hexlify(serial_bytes).decode().upper() or "∅")
+
+            if LOG_LEGACY:
+                cs_len = 0 if checksum_mode == "TRUNC" else (1 if checksum_mode == "SUM8" else 2)
+                ser_len = 2 if len(serial_bytes) else 0
+                body_len_approx = max(0, int(length_byte) - (1 + ser_len + (0 if checksum_mode == "TRUNC" else cs_len)))
+                logger.info("[GT06] RX proto=0x%02X body_len~%d cs_len=%d from=%s",
+                            msg_type, body_len_approx, cs_len, peer)
+
+            # ACK imediato
+            ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
+            try:
+                writer.write(ack)
+                await writer.drain()
+            except Exception:
+                return
+
+            if LOG_LEGACY:
+                mode = "TRUNC" if checksum_mode == "TRUNC" else ("SUM" if checksum_mode == "SUM8" else "CRC16")
+                logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)", msg_type, _hex_spaced(ack), mode)
+            logger.info("[GT06] TX_ACK=%s", binascii.hexlify(ack).decode().upper())
+
+            # Dispatch
+            try:
+                if msg_type == 0x01:
+                    await handle_login(payload, binascii.hexlify(raw).decode().upper(), peer, state)
+                elif msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
+                    await handle_gps(payload, binascii.hexlify(raw).decode().upper(), state)
+                # 0x13 status, 0x08 keepalive → nada além do ACK
+            except Exception as e:
+                logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
 # ============================================================
 # Handlers
@@ -368,13 +447,11 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
                        binascii.hexlify(payload).decode().upper())
         return
 
-    # Se pulou login, tenta garantir o device pela última IMEI vista
+    # garante device via IMEI visto caso tenha pulado login
     if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) == 15:
         try:
             dev = await ensure_device_canonical("gt06", state.imei_seen)
-            devd = _device_as_dict(dev)
-            if devd:
-                state.device = devd
+            state.device = _device_as_dict(dev)
         except Exception:
             pass
 
@@ -383,100 +460,10 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
         return
 
     await _save_position_compat(state.device, gps, raw_hex)
-
     logger.info(
         "[GT06] POS salva device_id=%s lat=%.6f lon=%.6f v=%.1f km/h curso=%.1f valid=%s",
         state.device["id"], gps["lat"], gps["lon"], gps["speed_kmh"], gps["course"], gps["valid"]
     )
-
-# ============================================================
-# Frame loop (deframer por conexão)
-# ============================================================
-async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = await reader.read(n - len(buf))
-        if not chunk:
-            raise asyncio.IncompleteReadError(buf, n)
-        buf += chunk
-    return buf
-
-async def process_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
-    # Cabeçalho: 0x78 0x78 ou 0x79 0x79
-    hdr = await read_exact(reader, 2)
-    if hdr not in (b"\x78\x78", b"\x79\x79"):
-        # Pode ter vindo lixo/ASCII – tenta consumir até CRLF
-        try:
-            line = hdr + await reader.readuntil(b"\x0D\x0A")
-            if LOG_LEGACY:
-                logger.debug("[GT06] ASCII? %r", line)
-        except Exception:
-            pass
-        return
-
-    length_b = await read_exact(reader, 1)
-    length = length_b[0]
-
-    # (type + payload + checksum?) + CRLF (2)
-    body_and_footer = await read_exact(reader, length + 2)
-    raw = hdr + length_b + body_and_footer
-    raw_hex = binascii.hexlify(raw).decode().upper()
-
-    # Log estilo legado do pacote bruto
-    if LOG_LEGACY:
-        try:
-            logger.info("[GT06] CHUNK %dB from %s: %s", len(raw), peer, _hex_spaced(raw))
-        except Exception:
-            pass
-
-    checksum_mode, serial_bytes, payload_full = detect_checksum_and_serial(hdr, length, body_and_footer)
-    if not payload_full:
-        return
-
-    msg_type = payload_full[0]
-    payload = payload_full[1:]
-
-    # Logs (atuais)
-    logger.info("[GT06] RX type=0x%02X len_byte=%d chk=%s serial=%s",
-                msg_type, length, checksum_mode, binascii.hexlify(serial_bytes).decode().upper() or "∅")
-
-    # Logs no estilo legado
-    if LOG_LEGACY:
-        cs_len = 0 if checksum_mode == "TRUNC" else (1 if checksum_mode == "SUM8" else 2)
-        # aproxima body útil: length - (type + serial(2?) + checksum)
-        ser_len = 2 if len(serial_bytes) else 0
-        body_len_approx = max(0, length - (1 + ser_len + (0 if checksum_mode == "TRUNC" else cs_len)))
-        logger.info("[GT06] RX proto=0x%02X body_len~%d cs_len=%d from=%s",
-                    msg_type, body_len_approx, cs_len, peer)
-
-    # ACK imediato
-    ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
-    writer.write(ack)
-    await writer.drain()
-    if LOG_LEGACY:
-        mode = "TRUNC" if checksum_mode == "TRUNC" else ("SUM" if checksum_mode == "SUM8" else "CRC16")
-        logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)", msg_type, _hex_spaced(ack), mode)
-    logger.info("[GT06] TX_ACK=%s", binascii.hexlify(ack).decode().upper())
-
-    # Opcional: validação (já feita no detector)
-    if VALIDATE_GT06_CRC:
-        pass
-
-    # Dispatch
-    if msg_type == 0x01:                     # LOGIN
-        await handle_login(payload, raw_hex, peer, state)
-        return
-
-    if msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):  # POSIÇÃO
-        await handle_gps(payload, raw_hex, state)
-        return
-
-    if msg_type in (0x13, 0x08):             # STATUS/KEEPALIVE
-        return
-
-    # Outros tipos
-    logger.debug("[GT06] Tipo 0x%02X não tratado. payload=%s",
-                 msg_type, binascii.hexlify(payload).decode().upper())
 
 # ============================================================
 # Server
@@ -486,8 +473,7 @@ async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     logger.info("[TRV/GT06] Conexao de %s", peer)
     state = ConnState()
     try:
-        while True:
-            await process_frame(reader, writer, str(peer), state)
+        await _frame_loop(reader, writer, str(peer), state)
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     except Exception as e:
