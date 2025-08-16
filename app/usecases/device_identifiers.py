@@ -1,101 +1,50 @@
+# app/usecases/device_identifiers.py
 import os
-import asyncio
-from typing import Optional, Dict, Any
-
 import asyncpg
+from typing import Optional, Dict
 
-# ---------------------------------------------------------------------------
-# Config DB
-# ---------------------------------------------------------------------------
-# Aceita DATABASE_URL (formato asyncpg) e cai no default do docker-compose.
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgres://telemetry:telemetry@db:5432/telemetry",
-)
+_pool = None
 
-_pool: Optional[asyncpg.Pool] = None
-_pool_lock = asyncio.Lock()
-
-
-async def _ensure_pool() -> asyncpg.Pool:
+def _normalize_asyncpg_dsn(url: Optional[str]) -> str:
     """
-    Singleton de pool asyncpg com criação sob demanda.
+    Aceita DATABASE_URL estilo SQLAlchemy (ex.: postgresql+asyncpg://)
+    e normaliza para o formato aceito pelo asyncpg (postgresql://).
     """
+    if not url:
+        user = os.getenv("PGUSER", os.getenv("POSTGRES_USER", "telemetry"))
+        pwd  = os.getenv("PGPASSWORD", os.getenv("POSTGRES_PASSWORD", "telemetry"))
+        host = os.getenv("PGHOST", os.getenv("POSTGRES_HOST", "db"))
+        port = os.getenv("PGPORT", "5432")
+        db   = os.getenv("PGDATABASE", os.getenv("POSTGRES_DB", "telemetry"))
+        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+
+    if url.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + url.split("postgresql+asyncpg://", 1)[1]
+    if url.startswith("postgres+asyncpg://"):
+        return "postgres://" + url.split("postgres+asyncpg://", 1)[1]
+    return url
+
+async def _ensure_pool():
     global _pool
-    if _pool and not _pool._closed:
-        return _pool
-    async with _pool_lock:
-        if _pool and not _pool._closed:
-            return _pool
-        _pool = await asyncpg.create_pool(
-            dsn=DATABASE_URL,
-            min_size=1,
-            max_size=int(os.getenv("PG_MAX_POOL_SIZE", "10")),
-        )
+    if _pool is None:
+        raw = os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URI")
+        dsn = _normalize_asyncpg_dsn(raw)
+        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
     return _pool
 
-
-# ---------------------------------------------------------------------------
-# Upsert de identificadores auxiliares (ex.: gt06_last10)
-# ---------------------------------------------------------------------------
-async def upsert_device_identifier_by_device_id(
-    device_id: str,
-    id_type: str,
-    id_value: str,
-) -> Dict[str, Any]:
+async def resolve_device_by_last10(last10: str) -> Optional[Dict]:
     """
-    Insere ou atualiza (upsert) um identificador auxiliar para um device.
-    - device_id: devices.id (UUID/char(36))
-    - id_type:   ex.: 'gt06_last10'
-    - id_value:  ex.: '6126102974'
+    Busca o canônico pela view/tabela device_by_last10.
+    Retorna dict mínimo: {"id": <uuid|int>, "imei": <str>} ou None.
     """
     pool = await _ensure_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                INSERT INTO device_identifiers (device_id, id_type, id_value)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (id_type, id_value)
-                DO UPDATE SET
-                  device_id  = EXCLUDED.device_id,
-                  updated_at = now()
-                RETURNING id, device_id, id_type, id_value, created_at, updated_at
-                """,
-                device_id,
-                id_type,
-                id_value,
-            )
-            return dict(row) if row else {}
-
-
-# ---------------------------------------------------------------------------
-# Resolução de device por "last10" via VIEW device_by_last10
-# ---------------------------------------------------------------------------
-async def resolve_device_by_last10(last10: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca um device a partir dos últimos 10 dígitos do IMEI
-    usando a VIEW device_by_last10.
-    """
-    pool = await _ensure_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT *
+    async with pool.acquire() as con:
+        row = await con.fetchrow("""
+            SELECT canonical_id AS id, canonical_imei AS imei
             FROM device_by_last10
             WHERE last10 = $1
             LIMIT 1
-            """,
-            last10,
-        )
-        return dict(row) if row else None
-
-
-# ---------------------------------------------------------------------------
-# Compatibilidade: função antiga que chama a nova
-# ---------------------------------------------------------------------------
-async def find_device_by_last10(last10: str):
-    """
-    Alias para resolve_device_by_last10 (compatibilidade com trv.py antigo).
-    """
-    return await resolve_device_by_last10(last10)
+        """, last10)
+        if not row:
+            return None
+        return {"id": row["id"], "imei": row["imei"]}
