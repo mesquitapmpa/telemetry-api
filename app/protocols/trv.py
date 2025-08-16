@@ -261,14 +261,14 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         if imei_to_use:
                             try:
                                 await save_position(
-                                    imei=str(imei_to_use),
-                                    latitude=lat,
-                                    longitude=lon,
-                                    fix_time=dt,
-                                    speed_knots=spd_knots,
-                                    course_deg=crs,
-                                    valid=True,
-                                    raw=pkt.hex(),
+                                    imei_to_use,
+                                    lat,
+                                    lon,
+                                    dt,
+                                    spd_knots,
+                                    crs,
+                                    True,
+                                    pkt.hex(),
                                 )
                                 logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s",
                                             imei_to_use, lat, lon, spd_knots, crs, dt.isoformat())
@@ -331,14 +331,14 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         if imei_for_trv:
                             try:
                                 await save_position(
-                                    imei=imei_for_trv,
-                                    latitude=lat,
-                                    longitude=lon,
-                                    fix_time=fix_time if valid else datetime.now(timezone.utc),
-                                    speed_knots=spd_knots,
-                                    course_deg=crs,
-                                    valid=valid,
-                                    raw=line,
+                                    imei_for_trv,
+                                    lat,
+                                    lon,
+                                    fix_time if valid else datetime.now(timezone.utc),
+                                    spd_knots,
+                                    crs,
+                                    valid,
+                                    line,
                                 )
                                 logger.info("[TRV] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s",
                                             imei_for_trv, lat, lon, spd_knots, crs, fix_time.isoformat(), valid)
