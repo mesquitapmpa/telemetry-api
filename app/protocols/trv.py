@@ -29,7 +29,10 @@ def crc16_x25(data: bytes) -> int:
     for b in data:
         crc ^= b
         for _ in range(8):
-            crc = (crc >> 1) ^ 0x8408 if (crc & 1) else (crc >> 1)
+            if (crc & 1) != 0:
+                crc = (crc >> 1) ^ 0x8408
+            else:
+                crc >>= 1
     crc = ~crc & 0xFFFF
     return ((crc & 0xFF) << 8) | (crc >> 8)
 
@@ -39,6 +42,8 @@ def sum8(data: bytes) -> int:
 # ---------------- ACK builder ----------------
 def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
     hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
+
+    # SEMPRE normalize para 2 bytes no ACK (muitos clones exigem 2 bytes)
     ser = serial_bytes or b""
     if len(ser) == 0:
         ser = b"\x00\x00"
@@ -46,15 +51,17 @@ def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: st
         ser = b"\x00" + ser
     else:
         ser = ser[-2:]
+
     body = bytes([msg_type]) + ser
 
     if checksum_mode == "CRC16":
-        length = 1 + 2 + 2
+        length = 1 + 2 + 2           # type + serial(2) + CRC(2)
         pkt_wo_crc = hdr + bytes([length]) + body
         crc = crc16_x25(pkt_wo_crc[2:])
         return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
 
-    length = 1 + 2 + 1
+    # SUM-8
+    length = 1 + 2 + 1               # type + serial(2) + SUM(1)
     pkt_wo_sum = hdr + bytes([length]) + body
     cs = sum8(pkt_wo_sum[2:])
     return pkt_wo_sum + bytes([cs]) + b"\x0D\x0A"
@@ -71,31 +78,26 @@ def parse_datetime_bcd(dt6: bytes) -> datetime:
         return datetime.now(timezone.utc)
 
 def decode_bcd_imei(imei_bcd: bytes) -> str:
-    # 8 bytes BCD => 16 dígitos (muitos GT06 têm um '0' à esquerda)
+    # 8 bytes BCD => 16 dígitos
     return "".join(f"{(b >> 4) & 0xF}{b & 0xF}" for b in imei_bcd)
 
 def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     """
-    Extrai IMEI de LOGIN (type 0x01) de forma tolerante:
-    1) Tenta BCD nos 8 primeiros bytes (caso clássico: começa com 0x08 -> '0861...')
-       - Se vier 16 dígitos e o 1º for '0', remove-o e retorna os 15 restantes.
-       - Senão, retorna os últimos 15 dígitos.
-    2) ASCII (alguns clones usam 0x0F + 15 ASCII).
-    3) Variante '0x08 como marcador' (pouco comum, mas suportada).
-    4) Varredura de janelas de 8 bytes no payload.
+    LOGIN (0x01):
+      - BCD direto nos 8 bytes iniciais (mais comum; começa tipicamente com 0x08 em BCD)
+      - ASCII (0x0F + 15 ASCII)
+      - Variante 0x08 como 'marcador' (pouco comum; suportado)
+      - Varredura por 8 bytes plausíveis
     """
-    # 1) BCD direto no começo
+    # 1) BCD direto no começo (8 bytes)
     if len(payload) >= 8:
         s16 = decode_bcd_imei(payload[:8])
         if s16.isdigit():
-            if len(s16) == 16 and s16[0] == "0":
-                s15 = s16[1:16]
-            else:
-                s15 = s16[-15:]
+            s15 = s16[1:16] if (len(s16) == 16 and s16[0] == "0") else s16[-15:]
             if len(s15) == 15 and s15.isdigit():
                 return s15
 
-    # 2) ASCII marcador 0x0F
+    # 2) ASCII (0x0F + 15)
     if payload[:1] == b"\x0F" and len(payload) >= 16:
         try:
             s = payload[1:16].decode()
@@ -104,11 +106,11 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # 3) Variante '0x08 como marcador'
+    # 3) Variante '0x08 como marcador' (8 bytes a partir de payload[1:])
     if payload[:1] == b"\x08" and len(payload) >= 9:
         s16 = decode_bcd_imei(payload[1:9])
         if s16.isdigit():
-            s15 = s16[-15:] if s16[0] != "0" else s16[1:16]
+            s15 = s16[1:16] if (len(s16) == 16 and s16[0] == "0") else s16[-15:]
             if len(s15) == 15 and s15.isdigit():
                 return s15
 
@@ -116,7 +118,7 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     for i in range(0, max(0, len(payload) - 7)):
         s16 = decode_bcd_imei(payload[i:i+8])
         if s16.isdigit():
-            s15 = s16[-15:] if s16[0] != "0" else s16[1:16]
+            s15 = s16[1:16] if (len(s16) == 16 and s16[0] == "0") else s16[-15:]
             if len(s15) == 15 and s15.isdigit():
                 return s15
     return None
@@ -126,6 +128,7 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
     if len(payload) < 6 + 1 + 4 + 4 + 1 + 2:
         return None
     dt = parse_datetime_bcd(payload[0:6])
+
     lat_raw = int.from_bytes(payload[7:11], "big")
     lon_raw = int.from_bytes(payload[11:15], "big")
     speed_kmh = payload[15] * 1.852
@@ -150,18 +153,23 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
         "speed_kmh": speed_kmh,
         "course": course,
         "valid": gps_fixed,
-        "raw_flags": course_flags,
     }
 
 # ---------------- checksum/serial detector ----------------
 def detect_checksum_and_serial(hdr: bytes, length: int, body_and_footer: bytes) -> Tuple[str, bytes, bytes]:
+    """
+    Retorna (checksum_mode, serial_bytes, payload_full)
+    payload_full = [type(1)] + [payload... (+ possivel serial dentro)]
+    """
     if len(body_and_footer) < 3 or body_and_footer[-2:] != b"\x0D\x0A":
         return ("SUM8", b"", b"")
+
     core = body_and_footer[:-2]
     msg_type_b = core[:1]
     rest = core[1:]
+    msg_type = msg_type_b[0] if msg_type_b else 0x00
 
-    # CRC16? (últimos 2 bytes)
+    # 1) CRC-16: últimos 2 bytes são CRC
     if len(rest) >= 2:
         crc_recv = struct.unpack(">H", rest[-2:])[0]
         candidate = hdr + bytes([length]) + msg_type_b + rest[:-2]
@@ -170,15 +178,27 @@ def detect_checksum_and_serial(hdr: bytes, length: int, body_and_footer: bytes) 
             payload_full = msg_type_b + rest[:-2]
             return ("CRC16", serial, payload_full)
 
-    # SUM-8? (último byte)
+    # 2) SUM-8: último byte é soma
     if len(rest) >= 1:
         cs_recv = rest[-1]
         candidate = hdr + bytes([length]) + msg_type_b + rest[:-1]
         if sum8(candidate[2:]) == cs_recv:
-            serial = rest[-3:-1] if len(rest) >= 3 else b""
+            # ⚠️ especial: LOGIN (0x01) às vezes NÃO traz serial (ex.: 8 BCD + CS)
+            serial = b""
+            if msg_type == 0x01:
+                # BCD: 8 bytes IMEI -> rest = 8 + 1(cs) = 9   (sem serial)
+                # ASCII: 0x0F + 15 -> rest = 16 + 1(cs) = 17  (sem serial)
+                if len(rest) in (9, 17):
+                    serial = b""
+                elif len(rest) >= 11:
+                    serial = rest[-3:-1]
+            else:
+                if len(rest) >= 3:
+                    serial = rest[-3:-1]
             payload_full = msg_type_b + rest[:-1]
             return ("SUM8", serial, payload_full)
 
+    # 3) Degrada (frames curtíssimos, ex.: 7878 01 08 0D0A)
     return ("SUM8", b"", msg_type_b + rest)
 
 # ---------------- Sessão ----------------
@@ -241,6 +261,7 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
 async def gt06_frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
     buf = bytearray()
     while True:
+        # tente extrair todos os frames já em buffer
         while True:
             i78 = buf.find(b"\x78\x78")
             i79 = buf.find(b"\x79\x79")
@@ -250,7 +271,7 @@ async def gt06_frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWr
             i = min(idxs)
             if i > 0:
                 del buf[:i]
-            if len(buf) < 4:
+            if len(buf) < 5:
                 break
 
             hdr = bytes(buf[:2])
@@ -261,13 +282,15 @@ async def gt06_frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWr
             frame = bytes(buf[:j+2])
             del buf[:j+2]
 
-            if not (frame.startswith(b"\x78\x78") or frame.startswith(b"\x79\x79")) or len(frame) < 5:
+            if not (frame.startswith(b"\x78\x78") or frame.startswith(b"\x79\x79")):
                 continue
 
-            hdr_b = frame[:2]
-            len_b = frame[2]
+            try:
+                len_b = frame[2]
+            except Exception:
+                continue
             body_and_footer = frame[3:]
-            checksum_mode, serial_bytes, payload_full = detect_checksum_and_serial(hdr_b, len_b, body_and_footer)
+            checksum_mode, serial_bytes, payload_full = detect_checksum_and_serial(hdr, len_b, body_and_footer)
             if not payload_full:
                 if LOG_LEGACY:
                     logger.info("[GT06] Frame malformado: %s", _hex_spaced(frame))
@@ -282,22 +305,25 @@ async def gt06_frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWr
 
             # ACK
             try:
-                ack = build_ack(0x7878 if hdr_b == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
+                ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979,
+                                msg_type, serial_bytes, checksum_mode)
                 writer.write(ack)
                 await writer.drain()
                 if LOG_LEGACY:
-                    logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)", msg_type, _hex_spaced(ack),
+                    logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)",
+                                msg_type, _hex_spaced(ack),
                                 "SUM" if checksum_mode == "SUM8" else "CRC16")
             except Exception:
                 logger.exception("[GT06] Falha ao enviar ACK")
                 return
 
+            # Dispatch
             try:
                 if msg_type == 0x01:
                     await handle_login(payload, raw_hex, peer, state)
                 elif msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
                     await handle_gps(payload, raw_hex, state)
-                # 0x08/0x13 keepalive/status → sem ação além do ACK
+                # 0x08/0x13: keepalive/status → só ACK
             except Exception as e:
                 logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
