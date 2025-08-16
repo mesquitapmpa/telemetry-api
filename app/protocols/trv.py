@@ -131,17 +131,13 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
 # ACK builder
 # =========================
 def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
-    """
-    Monta ACK padrão GT06:
-      78 78 05 <type> <serial_hi> <serial_lo> <SUM> 0D 0A   (SUM-8)
-      78 78 05 <type> <serial_hi> <serial_lo> <CRC_H> <CRC_L> 0D 0A  (CRC16)
-    Para 0x7979 idem, trocando o header.
-    OBS: GT06 costuma somar/CRC em [len(0x05), type, serial_hi, serial_lo].
-    """
     hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
     serial = (serial_bytes or b"\x00\x00")[-2:].rjust(2, b"\x00")
-    length = 0x05  # GT06 usa '05' no ACK (mesmo em SUM)
+
+    # GT06 usa 0x05 no length do ACK (type+serial+checksum)
+    length = 0x05
     core = bytes([length, msg_type]) + serial
+
     if checksum_mode == "CRC16":
         crc = crc16_x25(core)
         return hdr + core + struct.pack(">H", crc) + b"\x0D\x0A"
@@ -161,18 +157,36 @@ class ConnState:
 # =========================
 # Handlers lógicos
 # =========================
+# helper no topo do arquivo (perto das utils)
+def _dev_fields(device) -> tuple[Optional[int], Optional[str]]:
+    if device is None:
+        return None, None
+    if isinstance(device, dict):
+        return device.get("id"), device.get("imei") or device.get("serial")
+    # objeto (ORM/Pydantic/etc)
+    return getattr(device, "id", None), getattr(device, "imei", getattr(device, "serial", None))
+
 async def handle_login(payload: bytes, peer: str, state: ConnState):
     imei = extract_login_imei_from_payload(payload) or ""
     state.imei_seen = imei or state.imei_seen
+
     if not (imei and imei.isdigit() and len(imei) == 15):
         logger.warning("[GT06] LOGIN sem IMEI válido; peer=%s payload=%s", peer, _hex_spaced(payload))
         return
-    dev = await ensure_device_canonical("gt06", imei)
-    if dev:
-        state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
-        logger.info("[GT06] LOGIN OK device_id=%s imei=%s peer=%s", state.device["id"], state.device["imei"], peer)
-    else:
+
+    device = await ensure_device_canonical("gt06", imei)
+    if not device:
         logger.warning("[GT06] LOGIN IMEI=%s sem device canônico; peer=%s", imei, peer)
+        return
+
+    dev_id, dev_imei = _dev_fields(device)
+    if not dev_id:
+        logger.warning("[GT06] Device retornado sem id; type=%s peer=%s", type(device).__name__, peer)
+        return
+
+    state.device = {"id": dev_id, "imei": dev_imei or imei}
+    logger.info("[GT06] LOGIN OK: device_id=%s imei=%s peer=%s", dev_id, state.device["imei"], peer)
+
 
 async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
     gps = parse_gps_basic(payload)
