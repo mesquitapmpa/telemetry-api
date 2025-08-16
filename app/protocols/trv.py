@@ -17,21 +17,21 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
+# ===== Config =====
 VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
-LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "false").lower() == "true"  # habilita logs no estilo antigo (RX proto=..., TX_ACK=...)
+# habilita logs no estilo antigo (para casar com seu grep: RX proto=..., POS ok, save_position falhou)
+LOG_LEGACY = os.getenv("GT06_LOG_LEGACY", "true").lower() == "true"
 
 # ============================================================
-# Helpers de log legado
+# Helpers / checksums
 # ============================================================
 def _hex_spaced(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
 
-# ============================================================
-# Checksums
-# ============================================================
 def crc16_x25(data: bytes) -> int:
     """
-    CRC-16/X25 (refletido), init=0xFFFF, xorout=0xFFFF (endianness de campo: big-endian).
+    CRC-16/X25 (reflected), init=0xFFFF, xorout=0xFFFF.
+    Campo no frame é big-endian. O Java calcula exatamente assim.
     """
     crc = 0xFFFF
     for b in data:
@@ -42,48 +42,43 @@ def crc16_x25(data: bytes) -> int:
             else:
                 crc >>= 1
     crc = ~crc & 0xFFFF
-    # muitos firmwares esperam o campo em big-endian; retornamos já como inteiro "normal"
+    # retornar no “wire order” (big-endian quando empacotar)
     return ((crc & 0xFF) << 8) | (crc >> 8)
 
 def sum8(data: bytes) -> int:
     return sum(data) & 0xFF
 
 # ============================================================
-# ACK (espelha checksum/serial)
+# ACK (mesma convenção do encoder Java/Traccar)
 # ============================================================
-def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
+def build_ack(header: bytes, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
     """
-    Monta ACK no formato do header recebido (0x7878 ou 0x7979) e mesmo modo de checksum.
-    - Para CRC16: length = type(1) + serial(2) + CRC(2)
-    - Para SUM-8: length = type(1) + serial(2) + SUM(1)
+    Header 0x7878 -> length de 1 byte; header 0x7979 -> length de 2 bytes.
+    Para ambos os modos, o Java usa length == 0x0005 (type + serial + checksum).
+    SUM-8: soma sobre [length + type + serial]
+    CRC16: CRC sobre [length + type + serial] (e gravado em 2 bytes)
     """
-    hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
-
-    # normaliza serial (muitos dispositivos esperam 2 bytes em ACK)
-    serial = serial_bytes or b""
-    if len(serial) == 0:
-        serial = b"\x00\x00"
-    elif len(serial) == 1:
-        serial = b"\x00" + serial
+    if header == b"\x79\x79":
+        length_f = b"\x00\x05"   # 2 bytes
     else:
-        serial = serial[-2:]  # garante 2 bytes
+        length_f = b"\x05"       # 1 byte
 
-    body_wo_chk = bytes([msg_type]) + serial
+    # normaliza serial em 2 bytes (muitos dispositivos esperam isso no ACK)
+    serial = (serial_bytes or b"")[-2:].rjust(2, b"\x00")
 
-    if checksum_mode == "CRC16":
-        length = 1 + len(serial) + 2
-        pkt_wo_crc = hdr + bytes([length]) + body_wo_chk
-        crc = crc16_x25(pkt_wo_crc[2:])
-        return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
+    core = bytes([msg_type]) + serial
+    pkt_wo_chk = header + length_f + core
 
-    # SUM-8
-    length = 1 + len(serial) + 1
-    pkt_wo_sum = hdr + bytes([length]) + body_wo_chk
-    cs = sum8(pkt_wo_sum[2:])
-    return pkt_wo_sum + bytes([cs]) + b"\x0D\x0A"
+    if checksum_mode == "CRC16" or header == b"\x79\x79":
+        crc = crc16_x25(pkt_wo_chk[2:])  # igual ao Java: sem o header no cálculo
+        return pkt_wo_chk + struct.pack(">H", crc) + b"\x0D\x0A"
+
+    # SUM-8 (0x7878)
+    cs = sum8(pkt_wo_chk[2:])
+    return pkt_wo_chk + bytes([cs]) + b"\x0D\x0A"
 
 # ============================================================
-# Utils
+# Utils: datas/IMEI/GPS
 # ============================================================
 def parse_datetime_bcd(dt6: bytes) -> datetime:
     if len(dt6) < 6:
@@ -96,23 +91,21 @@ def parse_datetime_bcd(dt6: bytes) -> datetime:
         return datetime.now(timezone.utc)
 
 def decode_bcd_imei(imei_bcd: bytes) -> str:
-    # IMEI como BCD (8 bytes => 16 dígitos)
     s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)
-    return s.lstrip('0')
+    return s.lstrip('0')[:15]
 
 def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     """
     payload do LOGIN (sem o byte de 'type' 0x01).
-    Suporta:
-      - 0x08 + 8 bytes BCD (padrão GT06)
+    GT06 real/Traccar suportam:
+      - 0x08 + 8 bytes BCD (padrão)
       - 0x0F + 15 bytes ASCII
-      - fallback: varrer janelas de 8 bytes plausíveis
+      - fallback varrendo janelas de 8 bytes BCD
     """
     if not payload:
         return None
 
-    # ASCII 15 (0x0F)
-    if len(payload) >= 1 and payload[0] == 0x0F and len(payload) >= 1 + 15:
+    if payload[0:1] == b"\x0F" and len(payload) >= 1 + 15:
         try:
             s = payload[1:1+15].decode()
             if s.isdigit() and len(s) == 15:
@@ -120,16 +113,14 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # BCD 8 (0x08)
-    if len(payload) >= 1 and payload[0] == 0x08 and len(payload) >= 1 + 8:
+    if payload[0:1] == b"\x08" and len(payload) >= 1 + 8:
         s = decode_bcd_imei(payload[1:1+8])
-        s = s[:15]
         if s.isdigit() and len(s) == 15:
             return s
 
-    # Fallback: varrer janelas de 8 bytes
+    # fallback
     for i in range(0, max(0, len(payload) - 7)):
-        s = decode_bcd_imei(payload[i:i+8])[:15]
+        s = decode_bcd_imei(payload[i:i+8])
         if s.isdigit() and len(s) == 15:
             return s
     return None
@@ -138,25 +129,24 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
     """
     GPS básico GT06 (0x10/0x11/0x12):
       [time6][flags1][lat4][lon4][speed1][course2]
-    - lat/lon vêm SEM sinal; hemisfério está nos bits 12/13 do campo course/status.
-    - bit11 => GPS fix (1=fixed)
-    - bit12 => 1=West (lon negativa)
-    - bit13 => 1=South (lat negativa)
+    - lat/lon: raw/1800000.0
+    - course/status:
+        bits 0..9  => curso
+        bit 11     => GPS fix (1=fixed)
+        bit 12     => 1=West (lon negativa)
+        bit 13     => 1=South (lat negativa)
     """
     if len(payload) < 6+1+4+4+1+2:
         return None
 
     dt = parse_datetime_bcd(payload[0:6])
 
-    # flags1 (nem sempre usado; alguns firmwares colocam outras infos aqui)
-    # Não confiamos nesse bit para 'valid'; usamos bit11 do course/status (padrão GT06)
-    # flags = payload[6]
-
+    # flags = payload[6]  # pouco confiável, clones variam; usamos o campo course/status
     lat_raw = int.from_bytes(payload[7:11], "big", signed=False)
     lon_raw = int.from_bytes(payload[11:15], "big", signed=False)
-    speed_kmh = payload[15] * 1.852
-
+    speed_kmh = float(payload[15])  # GT06 envia km/h (o Traccar converte para nós depois)
     course_flags = struct.unpack(">H", payload[16:18])[0]
+
     course = float(course_flags & 0x03FF)
     gps_fixed = bool(course_flags & (1 << 11))
     west = bool(course_flags & (1 << 12))
@@ -180,47 +170,53 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
     }
 
 # ============================================================
-# Detector de checksum/serial
+# Detector de checksum/serial (compatível com o Java)
 # ============================================================
-def detect_checksum_and_serial(hdr: bytes, length: int, body_and_footer: bytes) -> Tuple[str, bytes, bytes]:
+def detect_checksum_and_serial(header: bytes, length: int, body_and_footer: bytes) -> Tuple[str, bytes, bytes]:
     """
     Retorna (checksum_mode, serial_bytes, payload_full)
-    payload_full = [type(1)] + [payload... (+ possivel serial dentro)]
+    payload_full = [type(1)] + [payload (... possivelmente com serial no fim)]
+    - 0x7979: len de 2 bytes; final é CRC(2) + CRLF
+    - 0x7878: len de 1 byte; final costuma ser SUM(1) + CRLF; mas clones “mínimos” não têm serial/checksum
     """
-    if len(body_and_footer) < 1 + 2:  # pelo menos type + CRLF
-        return ("SUM8", b"", b"")
+    if len(body_and_footer) < 1 + 2:
+        return ("SUM8", b"", b"")  # incompleto
 
     if body_and_footer[-2:] != b"\x0D\x0A":
         return ("SUM8", b"", b"")
 
-    core = body_and_footer[:-2]  # remove CRLF
+    core = body_and_footer[:-2]  # retira CRLF
+    if len(core) < 1:
+        return ("SUM8", b"", b"")
+
     msg_type_b = core[:1]
     rest = core[1:]
 
-    # 1) Tentar CRC16: últimos 2 bytes são CRC
+    # Tenta CRC16: dois últimos bytes antes do CRLF
     if len(rest) >= 2:
         crc_recv = struct.unpack(">H", rest[-2:])[0]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-2]
+        # candidato inclui length (1 ou 2 bytes), type e payload (sem CRC)
+        candidate = header + (length.to_bytes(2, "big") if header == b"\x79\x79" else bytes([length])) + msg_type_b + rest[:-2]
         crc_calc = crc16_x25(candidate[2:])
         if crc_calc == crc_recv:
             serial = rest[-4:-2] if len(rest) >= 4 else b"\x00\x00"
-            payload_full = msg_type_b + rest[:-2]  # inclui serial ao final (se houver)
+            payload_full = msg_type_b + rest[:-2]  # inclui serial no final do payload (parser entende)
             return ("CRC16", serial, payload_full)
 
-    # 2) Tentar SUM-8: último byte é soma
+    # Tenta SUM-8 (se houver “sum”)
     if len(rest) >= 1:
         cs_recv = rest[-1]
-        candidate = hdr + bytes([length]) + msg_type_b + rest[:-1]
+        candidate = header + (length.to_bytes(2, "big") if header == b"\x79\x79" else bytes([length])) + msg_type_b + rest[:-1]
         if sum8(candidate[2:]) == cs_recv:
             serial = rest[-3:-1] if len(rest) >= 3 else b""
             payload_full = msg_type_b + rest[:-1]
             return ("SUM8", serial, payload_full)
 
-    # 3) Degrada (frames ultra-curtos / keepalive mínimo)
+    # Degrada (frames mínimos sem serial/checksum)
     return ("SUM8", b"", msg_type_b + rest)
 
 # ============================================================
-# Sessão por conexão (armazenar device canônico pós-login)
+# Sessão por conexão (device canônico após login)
 # ============================================================
 class ConnState:
     __slots__ = ("device", "imei_seen")
@@ -232,16 +228,10 @@ class ConnState:
 # Handlers
 # ============================================================
 async def handle_login(payload: bytes, peer: str, state: ConnState):
-    """
-    LOGIN GT06 (type 0x01).
-    payload pode vir como:
-      0x08 <8 bytes BCD IMEI> [ ... ]
-      0x0F <15 ASCII IMEI>    [ ... ]
-    """
     imei = extract_login_imei_from_payload(payload) or ""
-    state.imei_seen = imei or state.imei_seen
-
-    if not (imei and imei.isdigit() and len(imei) == 15):
+    if imei and imei.isdigit() and len(imei) == 15:
+        state.imei_seen = imei
+    else:
         logger.warning("[GT06] LOGIN sem IMEI válido/decodificável; sessão sem device. peer=%s", peer)
         return
 
@@ -260,8 +250,8 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
                        binascii.hexlify(payload).decode().upper())
         return
 
-    # Garante device canônico (se pulou login)
-    if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) >= 15:
+    # Se pulou login, tenta garantir pelo IMEI visto
+    if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) == 15:
         try:
             dev = await ensure_device_canonical("gt06", state.imei_seen)
             if dev:
@@ -270,7 +260,7 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
             pass
 
     if not state.device:
-        logger.warning("[GT06] Sem device canônico; descartando posição para evitar IMEI curto.")
+        logger.warning("[GT06] Sem device canônico; descartando posição (evita IMEI curto).")
         return
 
     payload_to_save = {
@@ -284,12 +274,17 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
         "valid": gps["valid"],
         "raw": raw_frame_hex,
     }
-    await save_position(payload_to_save)
-    logger.info("[GT06] POS salva device_id=%s lat=%.6f lon=%.6f v=%.1fkm/h curso=%.1f valid=%s",
-                state.device['id'], gps['lat'], gps['lon'], gps['speed_kmh'], gps['course'], gps['valid'])
+    try:
+        await save_position(payload_to_save)
+        # ===== linha para casar com seu grep =====
+        logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkm/h crs=%.1f t=%s v=%s",
+                    state.device['imei'], gps['lat'], gps['lon'], gps['speed_kmh'],
+                    gps['course'], gps['time'].isoformat(), gps['valid'])
+    except Exception as e:
+        logger.exception("[GT06] save_position falhou: %s", e)
 
 # ============================================================
-# Frame loop
+# Frame loop (porta direta do frame decoder Java)
 # ============================================================
 async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
     buf = b""
@@ -301,26 +296,34 @@ async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
     return buf
 
 async def process_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
+    # header
     hdr = await read_exact(reader, 2)
+
     if hdr not in (b"\x78\x78", b"\x79\x79"):
-        # Pode ser lixo/ASCII — tenta consumir até CRLF só pra limpar
+        # pode ser ASCII/lixo: consome até CRLF para limpar (igual nossa versão anterior)
         try:
             line = hdr + await reader.readuntil(b"\x0D\x0A")
-            logger.debug("[GT06] ASCII? %r", line)
+            if LOG_LEGACY:
+                logger.debug("[GT06] ASCII? %r", line)
         except Exception:
             pass
         return
 
-    length_b = await read_exact(reader, 1)
-    length = length_b[0]
+    # length
+    if hdr == b"\x79\x79":
+        length_b = await read_exact(reader, 2)
+        length = int.from_bytes(length_b, "big")
+    else:
+        length_b = await read_exact(reader, 1)
+        length = length_b[0]
 
-    # type + payload + checksum(?) + CRLF (2)
+    # body + checksum(opcional) + CRLF
     body_and_footer = await read_exact(reader, length + 2)
 
     raw = hdr + length_b + body_and_footer
     raw_hex = binascii.hexlify(raw).decode().upper()
 
-    # Log estilo legado do pacote bruto (CHUNK ...)
+    # Log estilo legado (CHUNK ...)
     if LOG_LEGACY:
         try:
             logger.info("[GT06] CHUNK %dB from %s: %s", len(raw), peer, _hex_spaced(raw))
@@ -334,51 +337,47 @@ async def process_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     msg_type = payload_full[0]
     payload = payload_full[1:]
 
-    # Logs RX/ACK (atuais)
-    logger.info("[GT06] RX type=0x%02X len=%d chk=%s serial=%s",
-                msg_type, length, checksum_mode, binascii.hexlify(serial_bytes).decode().upper() or "∅")
+    # ===== logs RX (compat seu grep) =====
+    if LOG_LEGACY:
+        cs_len = 2 if checksum_mode == "CRC16" or hdr == b"\x79\x79" else 1
+        # melhor aproximação do “body útil”: length - (type + serial(2?) + checksum(1/2))
+        serial_len = 2 if len(serial_bytes) >= 2 else 0
+        body_len = max(0, length - (1 + serial_len + cs_len))
+        logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s",
+                    msg_type, body_len, cs_len, peer)
 
-    # ACK imediato
-    ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
+    # ACK (igual traccar)
+    ack = build_ack(hdr, msg_type, serial_bytes, checksum_mode)
     writer.write(ack)
     await writer.drain()
+
     ack_hex = binascii.hexlify(ack).decode().upper()
     logger.info("[GT06] TX_ACK=%s", ack_hex)
-
-    # Logs no estilo legado adicionais
     if LOG_LEGACY:
-        cs_len = 1 if checksum_mode == "SUM8" else 2
-        # aproximação do body "útil": length - (type + serial + checksum)
-        body_len = max(0, length - (1 + len(serial_bytes or b"\x00\x00") + cs_len))
-        mode = "SUM" if checksum_mode == "SUM8" else "CRC16"
-        logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s", msg_type, body_len, cs_len, peer)
+        mode = "CRC16" if (checksum_mode == "CRC16" or hdr == b"\x79\x79") else "SUM"
         logger.info("[GT06] 0x%02X TX_ACK=%s (mode=%s)", msg_type, _hex_spaced(ack), mode)
-
-        # STATUS extra
         if msg_type == 0x13:
             payload_wo_serial = payload[:-len(serial_bytes)] if (len(serial_bytes) and len(payload) >= len(serial_bytes)) else payload
             logger.info("[GT06] STATUS(0x13) payload=%s serial=%s",
                         _hex_spaced(payload_wo_serial) or "∅",
                         binascii.hexlify(serial_bytes).decode().upper() or "∅")
-
-        # keepalive curtíssimo (alguns clones mandam 0x08 sem payload)
-        if msg_type == 0x08 and length <= (1 + cs_len):
+        if msg_type == 0x08 and length <= (1 + (0 if len(serial_bytes)==0 else 2) + (0 if len(payload)==0 else 0)):
             logger.info("[GT06] SHORT(min) proto=0x08 TX_ACK=%s (mode=%s)", _hex_spaced(ack), mode)
 
-    # Opcional: validar checksum (já foi validado na detecção)
+    # (opcional) validação estrita
     if VALIDATE_GT06_CRC:
         pass
 
-    # Dispatch
-    if msg_type == 0x01:
+    # Dispatch por tipo
+    if msg_type == 0x01:             # LOGIN
         await handle_login(payload, peer, state)
         return
 
-    if msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
+    if msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):  # GPS básicos e variantes
         await handle_gps(payload, raw_hex, state)
         return
 
-    if msg_type in (0x13, 0x08):  # STATUS/KEEPALIVE
+    if msg_type in (0x13, 0x08):     # STATUS/KEEPALIVE
         return
 
     logger.debug("[GT06] Tipo 0x%02X não tratado. payload=%s",
