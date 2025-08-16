@@ -71,4 +71,31 @@ async def upsert_device_identifier_by_device_id(
 
 # ---------------------------------------------------------------------------
 # Resolução de device por "last10" via VIEW device_by_last10
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+async def resolve_device_by_last10(last10: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca um device a partir dos últimos 10 dígitos do IMEI
+    usando a VIEW device_by_last10.
+    """
+    pool = await _ensure_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM device_by_last10
+            WHERE last10 = $1
+            LIMIT 1
+            """,
+            last10,
+        )
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Compatibilidade: função antiga que chama a nova
+# ---------------------------------------------------------------------------
+async def find_device_by_last10(last10: str):
+    """
+    Alias para resolve_device_by_last10 (compatibilidade com trv.py antigo).
+    """
+    return await resolve_device_by_last10(last10)
