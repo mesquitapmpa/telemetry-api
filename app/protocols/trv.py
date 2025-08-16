@@ -1,4 +1,3 @@
-# app/protocols/trv_gt06.py
 import asyncio
 import logging
 import os
@@ -149,15 +148,13 @@ def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
     """
     if len(buf) < i + 3:
         return None
-
-    # Procura 0D 0A depois de '78 78 len'
     tail = buf.find(b"\x0D\x0A", i + 4)
     if tail < 0:
         return None
     end = tail + 2  # índice EXCLUSIVO
 
     # Tenta CRC-16 (2 bytes): body_crc = bytes entre 'len' e checksum
-    if end - (i + 3) - 2 >= 2 + 3:  # ≥ proto(1)+serial(2) no body
+    if end - (i + 3) - 2 >= 2 + 3:
         body_crc = buf[i + 3 : end - (2 + 2)]
         crc_field = int.from_bytes(buf[end - 2 - 2 : end - 2], "big")
         if _crc16_x25(body_crc) == crc_field:
@@ -170,7 +167,7 @@ def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
         if (_sum_cs(body_sum) & 0xFF) == sum_field:
             return (end, 1)
 
-    # Fallback seguro: assume SUM (a maioria dos clones usa 1B)
+    # Fallback seguro: assume SUM
     return (end, 1)
 
 def _gt06_validate_by_body(pkt: bytes, cs_len: int) -> bool:
@@ -195,7 +192,12 @@ def _gt06_parse_position(core: bytes):
       [8:12] lat_raw (1/1_800_000)
       [12:16] lon_raw (1/1_800_000)
       [16]   speed_kmh
-      [17:19] course/status (10 bits de rumo)
+      [17:19] course/status (10 bits de rumo + flags)
+    Flags típicas em course/status:
+      bit10: realtime/history
+      bit11: GPS fix
+      bit12: 0=E, 1=W  (aplica sinal no lon)
+      bit13: 0=N, 1=S  (aplica sinal no lat)
     """
     if len(core) < 19 or core[0] not in (0x12, 0x10):
         return None
@@ -204,13 +206,27 @@ def _gt06_parse_position(core: bytes):
         dt = datetime(2000 + yy, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
     except ValueError:
         dt = datetime.now(timezone.utc)
+
     lat_raw = int.from_bytes(core[8:12], "big")
     lon_raw = int.from_bytes(core[12:16], "big")
     lat = lat_raw / 1800000.0
     lon = lon_raw / 1800000.0
-    spd_knots = core[16] * 0.539957  # km/h → nós
-    course = int.from_bytes(core[17:19], "big") & 0x03FF
-    return lat, lon, float(spd_knots), float(course), dt
+
+    speed_knots = core[16] * 0.539957  # km/h → nós
+    flags = int.from_bytes(core[17:19], "big")
+    course = float(flags & 0x03FF)
+
+    # Bits de hemisfério + GPS fix
+    ew_west = bool(flags & (1 << 12))
+    ns_south = bool(flags & (1 << 13))
+    gps_fixed = bool(flags & (1 << 11))
+
+    if ew_west:
+        lon = -lon
+    if ns_south:
+        lat = -lat
+
+    return lat, lon, float(speed_knots), course, dt, gps_fixed
 
 # ==========================
 # Utilitários – TRV (GF22)
@@ -273,7 +289,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 logger.info("[TRV/GT06] %s desconectou", peer)
                 break
 
-            # debug bruto do que chegou
             logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, chunk.hex(" "))
             buf += chunk
 
@@ -293,9 +308,9 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 del buf[:end]
                 L = len(pkt)
 
-                # ---------- PATCH 1: heartbeat minimalista (sem serial/checksum) ----------
+                # HEARTBEAT minimalista (sem serial/checksum)
                 if L == 6 and pkt.startswith(b"\x78\x78\x01\x08") and pkt.endswith(b"\x0d\x0a"):
-                    serial = b"\x00\x00"  # não há serial; usamos 0000
+                    serial = b"\x00\x00"
                     ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
                     try:
                         writer.write(ack); await writer.drain()
@@ -304,7 +319,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK HEARTBEAT(min): %s", e)
                     continue
-                # --------------------------------------------------------------------------
 
                 # body: tudo entre 'len' e o checksum (sem CRLF)
                 body = pkt[3 : L - (cs_len + 2)]
@@ -319,25 +333,25 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
                 proto = body[0]
                 serial = body[-2:]
+                payload = body[1:-2]  # sem proto e sem serial
+
                 logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s",
                             proto, len(body), cs_len, peer)
 
                 # 0x01 LOGIN
                 if proto == 0x01:
-                    # Tolerante a variantes onde '0x08' e/ou IMEI vêm truncados
                     imei = ""
                     if len(body) >= 2:
                         maybe_len = body[1]
                         rest = body[2:-2] if len(body) > 4 else b""
                         if maybe_len in (0x08, 0x0F) and len(rest) >= 1:
-                            imei_bcd = rest  # pegue o que houver
+                            imei_bcd = rest
                         else:
-                            imei_bcd = body[1:-2]  # variante “curta”
+                            imei_bcd = body[1:-2]
                         imei = _gt06_bcd_imei(imei_bcd) if imei_bcd else ""
                     if not imei:
                         imei = "UNKNOWN_GT06"
 
-                    # nunca bloqueie o ACK por falha de BD
                     try:
                         await _ensure_device_safe(imei, "gt06", "gf22")
                     except Exception as e:
@@ -356,7 +370,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK LOGIN: %s", e)
 
-                # 0x08 HEARTBEAT
+                # 0x08 HEARTBEAT (com serial/checksum)
                 elif proto == 0x08:
                     ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
                     writer.write(ack); await writer.drain()
@@ -368,15 +382,19 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     core = body[:-2]  # remove serial do final do body
                     parsed = _gt06_parse_position(core)
                     if parsed:
-                        lat, lon, spd_knots, crs, dt = parsed
+                        if len(parsed) == 6:
+                            lat, lon, spd_knots, crs, dt, valid = parsed
+                        else:
+                            lat, lon, spd_knots, crs, dt = parsed
+                            valid = True
                         imei_to_use = gt06_imei or (peer_ip and _gt06_peer_cache.get(peer_ip))
                         if imei_to_use:
                             try:
                                 await _save_position_safe(
-                                    str(imei_to_use), lat, lon, dt, spd_knots, crs, True, pkt.hex()
+                                    str(imei_to_use), lat, lon, dt, spd_knots, crs, valid, pkt.hex()
                                 )
-                                logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s",
-                                            imei_to_use, lat, lon, spd_knots, crs, dt.isoformat())
+                                logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s",
+                                            imei_to_use, lat, lon, spd_knots, crs, dt.isoformat(), valid)
                             except Exception as e:
                                 logger.exception("[GT06] save_position falhou: %s", e)
 
@@ -384,8 +402,26 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     writer.write(ack); await writer.drain()
                     logger.info("[GT06] POS TX_ACK=%s (mode=%s)", ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
+                # 0x13 STATUS (não tratado) – log detalhado e ACK
+                elif proto == 0x13:
+                    logger.info("[GT06] STATUS(0x13) payload=%s serial=%02X%02X",
+                                payload.hex(" "), serial[0], serial[1])
+                    ack = _ack_sum(0x13, serial) if cs_len == 1 else _ack_crc(0x13, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] 0x13 TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+
+                # 0x1A EXT/LBS (não tratado) – log detalhado e ACK
+                elif proto == 0x1A:
+                    logger.info("[GT06] EXT(0x1A) payload_len=%d payload=%s serial=%02X%02X",
+                                len(payload), payload.hex(" "), serial[0], serial[1])
+                    ack = _ack_sum(0x1A, serial) if cs_len == 1 else _ack_crc(0x1A, serial)
+                    writer.write(ack); await writer.drain()
+                    logger.info("[GT06] 0x1A TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+
                 else:
-                    # ---------- PATCH 2: ACK para proto não tratado ----------
+                    # ACK para qualquer proto não tratado
                     ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
                     try:
                         writer.write(ack); await writer.drain()
@@ -394,7 +430,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                                     "SUM" if cs_len == 1 else "CRC")
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK proto=0x%02X: %s", proto, e)
-                    # --------------------------------------------------------
 
             # 2) TRV (texto, linhas terminadas em '#')
             while True:
