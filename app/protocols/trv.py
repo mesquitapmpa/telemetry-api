@@ -308,16 +308,18 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 del buf[:end]
                 L = len(pkt)
 
-                # HEARTBEAT minimalista (sem serial/checksum)
-                if L == 6 and pkt.startswith(b"\x78\x78\x01\x08") and pkt.endswith(b"\x0d\x0a"):
-                    serial = b"\x00\x00"
-                    ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
+                # --- PELO BLOCO NOVO (GENÉRICO) ---
+                # Short 6B frames: 78 78 01 <proto> 0D 0A (ex.: 0x08 HB, 0x57 keepalive vendor)
+                if L == 6 and pkt.startswith(b"\x78\x78\x01") and pkt.endswith(b"\x0d\x0a"):
+                    mproto = pkt[3]
+                    serial = b"\x00\x00"  # não há serial no frame curto
+                    ack = _ack_sum(mproto, serial) if cs_len == 1 else _ack_crc(mproto, serial)
                     try:
                         writer.write(ack); await writer.drain()
-                        logger.info("[GT06] HEARTBEAT(min) TX_ACK=%s (mode=%s)",
-                                    ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                        logger.info("[GT06] SHORT(min) proto=0x%02X TX_ACK=%s (mode=%s)",
+                                    mproto, ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
                     except Exception as e:
-                        logger.exception("[GT06] Falha ao enviar ACK HEARTBEAT(min): %s", e)
+                        logger.exception("[GT06] Falha ao enviar ACK SHORT proto=0x%02X: %s", mproto, e)
                     continue
 
                 # body: tudo entre 'len' e o checksum (sem CRLF)
