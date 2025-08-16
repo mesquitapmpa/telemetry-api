@@ -1,13 +1,12 @@
 from fastapi import FastAPI
 from app.infra.db import init_db
 from app.interfaces.routes import router
-from app.protocols.trv import start_trv_server
+from app.protocols.trv_server import start_trv_server  # <= AQUI
 import os
 
 app = FastAPI(title="Telemetry API")
 app.include_router(router)
 
-# opcional: métricas
 if os.getenv("ENABLE_METRICS", "false").lower() == "true":
     from prometheus_fastapi_instrumentator import Instrumentator
     Instrumentator().instrument(app).expose(app)
