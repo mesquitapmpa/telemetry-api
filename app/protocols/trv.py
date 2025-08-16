@@ -23,6 +23,9 @@ if not logger.handlers:
     logger.addHandler(h)
 logger.setLevel(logging.INFO)
 
+# Protótipos GT06 que carregam posição neste firmware (360gps/GF22)
+GT06_PROTOS_POS = {0x12, 0x10, 0x11}
+
 # ==========================
 # Compat: funções sync/async e assinaturas flexíveis
 # ==========================
@@ -153,10 +156,10 @@ def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
         return None
     end = tail + 2  # índice EXCLUSIVO
 
-    # Tenta CRC-16 (2 bytes): body_crc = bytes entre 'len' e checksum
+    # Tenta CRC-16 (2 bytes)
     if end - (i + 3) - 2 >= 2 + 3:
         body_crc = buf[i + 3 : end - (2 + 2)]
-        crc_field = int.from_bytes(buf[end - 2 - 2 : end - 2], "big")
+        crc_field = int.from_bytes(buf[end - 4 : end - 2], "big")
         if _crc16_x25(body_crc) == crc_field:
             return (end, 2)
 
@@ -177,7 +180,7 @@ def _gt06_validate_by_body(pkt: bytes, cs_len: int) -> bool:
     L = len(pkt)
     body = pkt[3 : L - (cs_len + 2)]
     if cs_len == 2:
-        got = int.from_bytes(pkt[L - (2 + 2) : L - 2], "big")
+        got = int.from_bytes(pkt[L - 4 : L - 2], "big")
         return got == _crc16_x25(body)
     else:
         got = pkt[L - 3]
@@ -185,21 +188,21 @@ def _gt06_validate_by_body(pkt: bytes, cs_len: int) -> bool:
 
 def _gt06_parse_position(core: bytes):
     """
-    Payload SEM serial (proto + campos), para 0x12/0x10:
-      [0]    proto (0x12/0x10)
+    Payload SEM serial (proto + campos), para 0x12/0x10/0x11:
+      [0]    proto (0x12/0x10/0x11)
       [1:7]  YY MM DD hh mm ss
       [7]    sat/status
       [8:12] lat_raw (1/1_800_000)
       [12:16] lon_raw (1/1_800_000)
       [16]   speed_kmh
       [17:19] course/status (10 bits de rumo + flags)
-    Flags típicas em course/status:
+    Flags típicas:
       bit10: realtime/history
       bit11: GPS fix
       bit12: 0=E, 1=W  (aplica sinal no lon)
       bit13: 0=N, 1=S  (aplica sinal no lat)
     """
-    if len(core) < 19 or core[0] not in (0x12, 0x10):
+    if len(core) < 19 or core[0] not in GT06_PROTOS_POS:
         return None
     yy, mm, dd, hh, mi, ss = core[1:7]
     try:
@@ -216,7 +219,6 @@ def _gt06_parse_position(core: bytes):
     flags = int.from_bytes(core[17:19], "big")
     course = float(flags & 0x03FF)
 
-    # Bits de hemisfério + GPS fix
     ew_west = bool(flags & (1 << 12))
     ns_south = bool(flags & (1 << 13))
     gps_fixed = bool(flags & (1 << 11))
@@ -308,7 +310,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 del buf[:end]
                 L = len(pkt)
 
-                # --- PELO BLOCO NOVO (GENÉRICO) ---
                 # Short 6B frames: 78 78 01 <proto> 0D 0A (ex.: 0x08 HB, 0x57 keepalive vendor)
                 if L == 6 and pkt.startswith(b"\x78\x78\x01") and pkt.endswith(b"\x0d\x0a"):
                     mproto = pkt[3]
@@ -379,8 +380,8 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     logger.info("[GT06] HEARTBEAT TX_ACK=%s (mode=%s)",
                                 ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
-                # 0x12/0x10 POSIÇÃO
-                elif proto in (0x12, 0x10):
+                # 0x11/0x12/0x10 POSIÇÃO
+                elif proto in GT06_PROTOS_POS:
                     core = body[:-2]  # remove serial do final do body
                     parsed = _gt06_parse_position(core)
                     if parsed:
@@ -395,16 +396,17 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                                 await _save_position_safe(
                                     str(imei_to_use), lat, lon, dt, spd_knots, crs, valid, pkt.hex()
                                 )
-                                logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s",
-                                            imei_to_use, lat, lon, spd_knots, crs, dt.isoformat(), valid)
+                                logger.info("[GT06] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s (proto=0x%02X)",
+                                            imei_to_use, lat, lon, spd_knots, crs, dt.isoformat(), valid, proto)
                             except Exception as e:
                                 logger.exception("[GT06] save_position falhou: %s", e)
 
                     ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
                     writer.write(ack); await writer.drain()
-                    logger.info("[GT06] POS TX_ACK=%s (mode=%s)", ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                    logger.info("[GT06] POS TX_ACK=%s (proto=0x%02X mode=%s)",
+                                ack.hex(" "), proto, "SUM" if cs_len == 1 else "CRC")
 
-                # 0x13 STATUS (não tratado) – log detalhado e ACK
+                # 0x13 STATUS (muitos GF22/360gps mandam isso periodicamente)
                 elif proto == 0x13:
                     logger.info("[GT06] STATUS(0x13) payload=%s serial=%02X%02X",
                                 payload.hex(" "), serial[0], serial[1])
