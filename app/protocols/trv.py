@@ -45,28 +45,25 @@ def sum8(data: bytes) -> int:
 # ============================================================
 def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
     hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
-    # Normalize serial para 0/1/2 bytes conforme recebido (usamos como veio)
     serial = serial_bytes or b""
     body = bytes([msg_type]) + serial
 
     if checksum_mode == "CRC16":
-        # para compatibilidade, garantir 2 bytes de serial
         if len(serial) == 0:
             serial = b"\x00\x00"
         elif len(serial) == 1:
             serial = b"\x00" + serial
         body = bytes([msg_type]) + serial
-        length = 1 + len(serial) + 2  # type + serial(2) + crc(2)
+        length = 1 + len(serial) + 2      # type + serial + CRC(2)
         pkt_wo_crc = hdr + bytes([length]) + body
         crc = crc16_x25(pkt_wo_crc[2:])
         return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
 
-    # SUM-8 (1 byte)
-    length = 1 + len(serial) + 1  # type + serial + sum8
+    # SUM-8
+    length = 1 + len(serial) + 2          # <-- FIX AQUI (era +1)
     pkt_wo_sum = hdr + bytes([length]) + body
     cs = sum8(pkt_wo_sum[2:])
     return pkt_wo_sum + bytes([cs]) + b"\x0D\x0A"
-
 # ============================================================
 # Utils
 # ============================================================
