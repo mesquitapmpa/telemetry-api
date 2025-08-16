@@ -153,7 +153,6 @@ class ConnState:
 # Handlers
 # ============================================================
 async def handle_login(payload: bytes, peer: str, state: ConnState):
-    # LOGIN curto/long: geralmente 8 bytes BCD IMEI no início
     imei = decode_bcd_imei(payload[:8]) if len(payload) >= 8 else ""
     state.imei_seen = imei or state.imei_seen
 
@@ -161,12 +160,17 @@ async def handle_login(payload: bytes, peer: str, state: ConnState):
         logger.warning(f"[GT06] LOGIN sem IMEI decodificável (peer={peer})")
         return
 
+    # 🔒 Reforço: rejeita IMEI inválido/curto antes de tentar garantir
+    if not imei.isdigit() or len(imei) < 15:
+        logger.warning(f"[GT06] LOGIN rejeitado: IMEI inválido/curto (len={len(imei)}). Sessão permanecerá sem device. peer={peer}")
+        return
+
     device = await ensure_device_canonical("gt06", imei)
     if device:
         state.device = {"id": device.get("id"), "imei": device.get("imei")}
         logger.info(f"[GT06] LOGIN OK: device_id={state.device['id']} imei={state.device['imei']} peer={peer}")
     else:
-        logger.warning(f"[GT06] LOGIN IMEI curto sem canônico (last10={imei[-10:]}); sessão sem device.")
+        logger.warning(f"[GT06] LOGIN sem device canônico (IMEI válido) — verifique ensure_device(). peer={peer}")
 
 async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
     gps = parse_gps_basic(payload)
@@ -181,9 +185,12 @@ async def handle_gps(payload: bytes, raw_frame_hex: str, state: ConnState):
             if dev:
                 state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
 
+    # Garantir device canônico na sessão; se não houver (ex.: pulou login), tente via IMEI visto
     if not state.device:
-        logger.warning("[GT06] Sem device canônico; descartando posição para evitar IMEI curto.")
-        return
+        if state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) >= 15:
+            dev = await ensure_device_canonical("gt06", state.imei_seen)
+            if dev:
+                state.device = {"id": dev.get("id"), "imei": dev.get("imei")}
 
     # Salvar por device_id (evita criação por IMEI dentro do save_position)
     payload_to_save = {

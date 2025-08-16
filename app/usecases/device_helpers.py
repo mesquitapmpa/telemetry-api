@@ -10,6 +10,10 @@ async def ensure_device_canonical(protocol: str, imei: str) -> Optional[Dict]:
     """
     if imei and len(imei) >= 15:
         return await _ensure_device(protocol=protocol, imei=imei)
+    
+    if imei and len(imei) >= 15:
+        return await _ensure_device(protocol=protocol, imei=imei)
+    return None
 
     last10 = (imei or "")[-10:]
     if not last10:
