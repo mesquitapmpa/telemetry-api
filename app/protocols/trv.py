@@ -3,9 +3,9 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
-# Ajuste esses imports conforme sua estrutura
+# Ajuste conforme seu projeto
 from app.usecases.save_position import ensure_device, save_position
 
 # ==========================
@@ -17,7 +17,6 @@ VALIDATE_GT06_CRC = os.getenv("GT06_VALIDATE_CRC", "false").lower() == "true"
 
 logger = logging.getLogger("trv_gt06")
 if not logger.handlers:
-    # Garante saída no stdout mesmo se o root não estiver configurado
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(h)
@@ -32,12 +31,8 @@ def _gt06_bcd_imei(b: bytes) -> str:
     s = ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
     return s.lstrip('0')[:15]
 
-
 def _crc16_x25(data: bytes) -> int:
-    """
-    CRC-16/X25 (ITU), polinômio 0x1021 refletido (0x8408), init 0xFFFF, final XOR 0xFFFF.
-    Retorna inteiro (0..65535).
-    """
+    """CRC-16/X25 (ITU), poly 0x8408 (reflected), init 0xFFFF, xorout 0xFFFF."""
     crc = 0xFFFF
     for b in data:
         crc ^= b
@@ -48,12 +43,15 @@ def _crc16_x25(data: bytes) -> int:
                 crc >>= 1
     return (~crc) & 0xFFFF
 
+def _sum_cs(data: bytes) -> int:
+    """Checksum simples de 1 byte (soma & 0xFF)."""
+    return sum(data) & 0xFF
 
-def _gt06_ack(proto: int, serial: bytes) -> bytes:
+def _ack_crc(proto: int, serial: bytes) -> bytes:
     """
-    Constrói ACK do GT06:
+    ACK com CRC-16 (2 bytes):
       78 78 05 <proto> <serial_hi> <serial_lo> <CRC_hi> <CRC_lo> 0D 0A
-    Onde CRC = CRC-16/X25 sobre os bytes [0x05, proto, serial_hi, serial_lo]
+    CRC sobre [0x05, proto, serial_hi, serial_lo]
     """
     if len(serial) != 2:
         serial = serial[:2].rjust(2, b"\x00")
@@ -61,45 +59,54 @@ def _gt06_ack(proto: int, serial: bytes) -> bytes:
     crc = _crc16_x25(body)
     return b"\x78\x78" + body + crc.to_bytes(2, "big") + b"\x0D\x0A"
 
-
-def _gt06_calc_frame_len(buf: bytearray, i: int) -> Optional[int]:
+def _ack_sum(proto: int, serial: bytes) -> bytes:
     """
-    Calcula o comprimento total do frame a partir do índice i (onde buf[i:i+2] == 0x78 0x78).
+    ACK com checksum de 1 byte (soma):
+      78 78 05 <proto> <serial_hi> <serial_lo> <CS> 0D 0A
+    CS = sum([0x05, proto, serial_hi, serial_lo]) & 0xFF
+    """
+    if len(serial) != 2:
+        serial = serial[:2].rjust(2, b"\x00")
+    body = bytes([0x05, proto]) + serial
+    cs = _sum_cs(body[0:])  # igual ao que muitos clones usam
+    return b"\x78\x78" + body + bytes([cs]) + b"\x0D\x0A"
+
+def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
+    """
+    Detecta o comprimento total do frame e o 'estilo' do checksum:
+      - Retorna (frame_len, cs_len) com cs_len ∈ {1,2}
+      - Procura 0D 0A após len e payload.
     Formato geral:
-      header(2=0x78,0x78) + len(1) + payload(len bytes) + crc(2) + tail(2=0x0D,0x0A)
+      78 78 | len(1) | payload(len) | cs(1 ou 2) | 0D 0A
     """
     if len(buf) < i + 3:
         return None
     ln = buf[i + 2]
-    # hdr(2) + len(1) + payload(ln) + CRC(2) + CRLF(2)
-    return 2 + 1 + ln + 2 + 2
+    # candidatos:
+    end_cs1 = i + 2 + 1 + ln + 1 + 2   # 1 byte cs
+    end_crc = i + 2 + 1 + ln + 2 + 2   # 2 bytes crc
+    # checa cauda 0D0A
+    if len(buf) >= end_cs1 and buf[end_cs1-2:end_cs1] == b"\x0D\x0A":
+        return (end_cs1, 1)
+    if len(buf) >= end_crc and buf[end_crc-2:end_crc] == b"\x0D\x0A":
+        return (end_crc, 2)
+    return None  # incompleto (aguarda mais bytes)
 
-
-def _gt06_validate_crc(pkt: bytes) -> bool:
-    """
-    Valida CRC do frame GT06 (opcional). 'pkt' é o frame completo (inclui 78 78 ... 0D 0A).
-    """
-    if len(pkt) < 7:
-        return False
+def _gt06_validate(pkt: bytes, cs_len: int) -> bool:
+    """Valida o frame opcionalmente, conforme o tipo de checksum detectado."""
+    if not VALIDATE_GT06_CRC:
+        return True
     ln = pkt[2]
-    payload = pkt[3 : 3 + ln]          # len bytes
-    crc_in = int.from_bytes(pkt[3 + ln : 3 + ln + 2], "big")
-    crc_calc = _crc16_x25(payload)
-    return crc_in == crc_calc
-
+    payload = pkt[3 : 3 + ln]
+    if cs_len == 2:
+        got = int.from_bytes(pkt[3 + ln : 3 + ln + 2], "big")
+        return got == _crc16_x25(payload)
+    else:
+        got = pkt[3 + ln]
+        return got == (_sum_cs(payload) & 0xFF)
 
 def _gt06_parse_position(core: bytes):
-    """Recebe payload SEM serial (proto + campos), para 0x12/0x10.
-    Estrutura esperada:
-      [0]    proto (0x12/0x10)
-      [1:7]  YY MM DD hh mm ss
-      [7]    sat/status
-      [8:12] lat_raw (1/1_800_000)
-      [12:16] lon_raw (1/1_800_000)
-      [16]   speed_kmh
-      [17:19] course/status (10 bits de rumo)
-    Retorna (lat, lon, speed_knots, course_deg, dt_utc) ou None.
-    """
+    """Recebe payload SEM serial (proto + campos), para 0x12/0x10."""
     if len(core) < 19:
         return None
     proto = core[0]
@@ -118,29 +125,20 @@ def _gt06_parse_position(core: bytes):
     course = int.from_bytes(core[17:19], "big") & 0x03FF
     return lat, lon, float(spd_knots), float(course), dt
 
-
 # ==========================
 # Utilitários – TRV (GF22)
 # ==========================
 
 _trv_login_re = re.compile(r"^TRVAP00(?P<imei>\d{15})#$")
 
-
 def _trv_ack_login() -> str:
-    # Ex.: TRVBP00YYMMDDHHMMSS# (padrão visto nos seus testes)
     now = datetime.now(timezone.utc)
     return f"TRVBP00{now:%y%m%d%H%M%S}#"
-
 
 def _trv_ack_heartbeat() -> str:
     return "TRVZP16#"
 
-
 def _trv_parse_yp14(line: str):
-    """Parser para TRVYP14.
-    Exemplo: TRVYP14250815A0107.5297S04858.0058W001.15123.45#
-    Retorna: (lat, lon, spd_knots, course, fix_time_utc, valid) ou None.
-    """
     m = re.search(
         r"TRVYP14(?P<d>\d{6})(?P<v>[AV])"
         r"(?P<latdeg>\d{2})(?P<latmin>\d{2}\.\d+)(?P<lats>[NS])"
@@ -151,7 +149,6 @@ def _trv_parse_yp14(line: str):
     if not m:
         return None
     d = m.group("d")  # YYMMDD
-    # Alguns firmwares não trazem hora; usamos data do frame + hora atual (UTC) como fallback simples
     base = datetime.strptime(d, "%y%m%d").replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     fix_time = base.replace(hour=now.hour, minute=now.minute, second=now.second)
@@ -171,16 +168,11 @@ def _trv_parse_yp14(line: str):
     valid = m.group("v") == "A"
     return lat, lon, spd_knots, crs, fix_time, valid
 
-
 # ==========================
 # Caches simples
 # ==========================
-
-# TRV: associa IP→IMEI para o caso de YP14 chegar em outra conexão
-_peer_cache: dict[str, str] = {}
-# GT06: idem, para posições que chegam sem login na mesma conexão
-_gt06_peer_cache: dict[str, str] = {}
-
+_peer_cache: dict[str, str] = {}       # TRV  : IP → IMEI
+_gt06_peer_cache: dict[str, str] = {}  # GT06 : IP → IMEI
 
 # ==========================
 # Handler TCP com autodetecção
@@ -188,9 +180,7 @@ _gt06_peer_cache: dict[str, str] = {}
 
 async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    peer_ip = None
-    if isinstance(peer, tuple):
-        peer_ip = peer[0]
+    peer_ip = peer[0] if isinstance(peer, tuple) else None
 
     buf = bytearray()
     gt06_imei: Optional[str] = None
@@ -205,78 +195,73 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 break
             buf += chunk
 
-            # 1) Frames GT06 (binário: 0x78 0x78 ... CRC(2) ... 0x0D 0x0A)
+            # 1) GT06 (binário)
             while True:
                 i = buf.find(b"\x78\x78")
                 if i < 0 or len(buf) < i + 3:
                     break
 
-                frame_len = _gt06_calc_frame_len(buf, i)
-                if frame_len is None:
-                    break  # incompleto
+                det = _loc_cs_style(buf, i)
+                if det is None:
+                    break  # incompleto, aguardar mais bytes
+                end, cs_len = det
 
-                end = i + frame_len
-                if len(buf) < end:
-                    break  # frame incompleto
-
-                # Captura frame completo e consume do buffer
                 pkt = bytes(buf[i:end])
                 del buf[:end]
 
-                if VALIDATE_GT06_CRC and not _gt06_validate_crc(pkt):
-                    logger.warning("[GT06] CRC invalido de %s: %s", peer, pkt.hex(" "))
-                    continue
-
                 ln = pkt[2]
-                payload = pkt[3 : 3 + ln]  # proto.. + serial(2)
+                payload = pkt[3 : 3 + ln]  # inclui proto ... serial(2)
                 proto = payload[0]
                 serial = payload[-2:]
 
-                # Debug básico
-                logger.info("[GT06] RX proto=0x%02X len=%d from=%s", proto, ln, peer)
+                if not _gt06_validate(pkt, cs_len):
+                    logger.warning("[GT06] Checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
+                    # Continua, mas ignora esse frame
+                    continue
 
-                # Login (0x01). Formato comum: 78 78 0D 01 08 [IMEI(8B BCD)] [serial(2)] [crc(2)] 0D 0A
+                logger.info("[GT06] RX proto=0x%02X len=%d cs_len=%d from=%s", proto, ln, cs_len, peer)
+
+                # 0x01 LOGIN
                 if proto == 0x01 and len(payload) >= 1 + 8 + 2:
                     imei_bcd = payload[1:9]
                     gt06_imei = _gt06_bcd_imei(imei_bcd)
+
                     try:
                         await ensure_device(gt06_imei, protocol="gt06", model="gf22")
                     except Exception as e:
                         logger.exception("[GT06] ensure_device falhou: %s", e)
 
-                    # cache IP→IMEI
                     if peer_ip:
                         _gt06_peer_cache[peer_ip] = gt06_imei
 
-                    # ACK (eco do serial + CRC X25)
-                    ack = _gt06_ack(0x01, serial)
-                    writer.write(ack)
-                    await writer.drain()
-                    logger.info("[GT06] LOGIN imei=%s serial=%02X%02X ack=%s",
-                                gt06_imei, serial[0], serial[1], ack.hex(" "))
+                    ack = _ack_sum(0x01, serial) if cs_len == 1 else _ack_crc(0x01, serial)
+                    try:
+                        writer.write(ack)
+                        await writer.drain()
+                        logger.info("[GT06] LOGIN imei=%s serial=%02X%02X TX_ACK=%s (mode=%s)",
+                                    gt06_imei, serial[0], serial[1], ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                    except Exception as e:
+                        logger.exception("[GT06] Falha ao enviar ACK LOGIN: %s", e)
 
-                # Heartbeat (0x08)
+                # 0x08 HEARTBEAT
                 elif proto == 0x08:
-                    ack = _gt06_ack(0x08, serial)
+                    ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
                     writer.write(ack)
                     await writer.drain()
-                    logger.info("[GT06] HEARTBEAT ack=%s", ack.hex(" "))
+                    logger.info("[GT06] HEARTBEAT TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
-                # Localização (0x12/0x10)
+                # 0x12/0x10 POSIÇÃO
                 elif proto in (0x12, 0x10):
-                    # 'payload' inclui [proto ... serial(2)], então:
-                    core = payload[:-2]  # remove os 2 bytes do serial
+                    core = payload[:-2]  # remove serial
                     parsed = _gt06_parse_position(core)
                     if parsed:
                         lat, lon, spd_knots, crs, dt = parsed
-                        imei_to_use = gt06_imei
-                        if not imei_to_use and peer_ip:
-                            imei_to_use = _gt06_peer_cache.get(peer_ip)
-
+                        imei_to_use = gt06_imei or (peer_ip and _gt06_peer_cache.get(peer_ip))
                         if imei_to_use:
                             try:
                                 await save_position(
-                                    imei=imei_to_use,
+                                    imei=str(imei_to_use),
                                     latitude=lat,
                                     longitude=lon,
                                     fix_time=dt,
@@ -290,31 +275,26 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                             except Exception as e:
                                 logger.exception("[GT06] save_position falhou: %s", e)
 
-                    # ACK posição mantém sessão viva
-                    ack = _gt06_ack(proto, serial)
+                    ack = _ack_sum(proto, serial) if cs_len == 1 else _ack_crc(proto, serial)
                     writer.write(ack)
                     await writer.drain()
-                    logger.info("[GT06] POS ACK=%s", ack.hex(" "))
+                    logger.info("[GT06] POS TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
                 else:
-                    # Outros protos: log básico
-                    logger.info("[GT06] Proto nao tratado: 0x%02X", proto)
+                    logger.info("[GT06] Proto nao tratado: 0x%02X (cs_len=%d)", proto, cs_len)
 
-            # 2) Linhas TRV (terminadas em '#')
+            # 2) TRV (texto, linhas terminadas em '#')
             while True:
                 j = buf.find(b"#")
                 if j < 0:
                     break
                 line = bytes(buf[: j + 1]).decode(errors="ignore").strip()
                 del buf[: j + 1]
-                if not line:
+                if not line or not line.startswith("TRV"):
                     continue
 
-                if not line.startswith("TRV"):
-                    # demais linhas: ignorar silenciosamente
-                    continue
-
-                # Login TRV: TRVAP00<IMEI 15d>#
+                # Login TRV: TRVAP00<IMEI15>#
                 m = _trv_login_re.match(line)
                 if m:
                     imei = m.group("imei")
@@ -348,7 +328,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         imei_for_trv: Optional[str] = None
                         if ALLOW_IP_CACHE and peer_ip:
                             imei_for_trv = _peer_cache.get(peer_ip)
-
                         if imei_for_trv:
                             try:
                                 await save_position(
@@ -362,17 +341,14 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                                     raw=line,
                                 )
                                 logger.info("[TRV] POS ok imei=%s lat=%.6f lon=%.6f spd=%.1fkn crs=%.1f t=%s v=%s",
-                                            imei_for_trv, lat, lon, spd_knots, crs,
-                                            fix_time.isoformat(), valid)
+                                            imei_for_trv, lat, lon, spd_knots, crs, fix_time.isoformat(), valid)
                             except Exception as e:
                                 logger.exception("[TRV] save_position falhou: %s", e)
                     continue
 
-                # Outros TRV*: ignore ou log
                 logger.info("[TRV] Linha nao tratada: %s", line)
 
     except Exception as e:
-        # Evita derrubar o servidor por frame malformado
         logger.exception("[TRV/GT06] Erro na conexao %s: %s", peer, e)
     finally:
         try:
@@ -380,7 +356,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             await writer.wait_closed()
         except Exception:
             pass
-
 
 async def start_trv_server():
     server = await asyncio.start_server(_handle, "0.0.0.0", TRV_PORT)
