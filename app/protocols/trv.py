@@ -190,6 +190,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         while True:
             chunk = await reader.read(1024)
+            logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, chunk.hex(" "))
             if not chunk:
                 logger.info("[TRV/GT06] %s desconectou", peer)
                 break
