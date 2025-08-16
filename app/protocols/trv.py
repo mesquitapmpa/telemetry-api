@@ -6,7 +6,7 @@ import inspect
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Any, Dict
 
-# Ajuste conforme seu projeto (mantive seus imports)
+# Ajuste conforme seu projeto
 from app.usecases.save_position import ensure_device, save_position
 
 # ==========================
@@ -28,24 +28,18 @@ logger.setLevel(logging.INFO)
 # ==========================
 
 async def _call_maybe_async(fn, *args, **kwargs):
+    """Chama função sync/async; se TypeError por kwargs, tenta posicional."""
     try:
         res = fn(*args, **kwargs)
     except TypeError:
-        # Tenta sem kwargs se houver conflito de nomes
         res = fn(*args)
     if inspect.isawaitable(res):
         return await res
     return res
 
 async def _ensure_device_safe(imei: str, protocol: str, model: Optional[str] = None):
-    """
-    Chama ensure_device como:
-    - ensure_device(imei, protocol, model)  (posicional)
-    - ensure_device(imei=..., protocol=..., model=...) (nomeado)
-    Funciona sync/async.
-    """
+    """Tenta ensure_device posicional e, se falhar, nomeado. Nunca bloqueia o fluxo."""
     try:
-        # primeiro tenta posicional (menos chance de conflito com nomes diferentes)
         return await _call_maybe_async(ensure_device, imei, protocol, model)
     except Exception as e1:
         try:
@@ -71,15 +65,11 @@ def _normalize_param_name(name: str) -> str:
 async def _save_position_safe(imei: str, lat: float, lon: float, dt: datetime,
                               speed_knots: Optional[float], course_deg: Optional[float],
                               valid: bool, raw: str):
-    """
-    Tenta mapear por nomes se disponíveis; senão cai para ordens posicionais comuns.
-    Funciona com save_position sync ou async.
-    """
-    # 1) Tenta por nomes (introspecção)
+    """Compat: tenta por nomes (introspecção) e cai para ordens posicionais comuns."""
+    # 1) Tentativa por nomes
     try:
         sig = inspect.signature(save_position)
         params = list(sig.parameters.keys())
-        # Monta kwargs com os nomes reconhecidos
         kw: Dict[str, Any] = {}
         for p in params:
             pn = _normalize_param_name(p)
@@ -96,13 +86,10 @@ async def _save_position_safe(imei: str, lat: float, lon: float, dt: datetime,
     except Exception:
         pass
 
-    # 2) Tenta ordens posicionais mais comuns do seu stack
+    # 2) Ordens posicionais comuns
     attempts = [
-        # (imei, lat, lon, fix_time, speed_knots, course_deg, valid, raw)
         (imei, lat, lon, dt, speed_knots, course_deg, valid, raw),
-        # (imei, lat, lon, speed_knots, course_deg, fix_time, valid, raw)
         (imei, lat, lon, speed_knots, course_deg, dt, valid, raw),
-        # (imei, dt, lat, lon, speed_knots, course_deg, valid, raw)
         (imei, dt, lat, lon, speed_knots, course_deg, valid, raw),
     ]
     last_err = None
@@ -120,10 +107,12 @@ async def _save_position_safe(imei: str, lat: float, lon: float, dt: datetime,
 # ==========================
 
 def _gt06_bcd_imei(b: bytes) -> str:
+    """8 bytes BCD → 16 dígitos; retornar 15 dígitos IMEI sem zeros à esquerda."""
     s = ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
     return s.lstrip('0')[:15]
 
 def _crc16_x25(data: bytes) -> int:
+    """CRC-16/X25 (ITU), poly 0x8408 (reflected), init 0xFFFF, xorout 0xFFFF."""
     crc = 0xFFFF
     for b in data:
         crc ^= b
@@ -135,9 +124,11 @@ def _crc16_x25(data: bytes) -> int:
     return (~crc) & 0xFFFF
 
 def _sum_cs(data: bytes) -> int:
+    """Checksum simples de 1 byte (soma & 0xFF) usado por clones GT06."""
     return sum(data) & 0xFF
 
 def _ack_crc(proto: int, serial: bytes) -> bytes:
+    """ACK com CRC-16 (2 bytes): 78 78 05 <proto> <serial_hi> <serial_lo> <CRC_hi> <CRC_lo> 0D 0A"""
     if len(serial) != 2:
         serial = serial[:2].rjust(2, b"\x00")
     body = bytes([0x05, proto]) + serial
@@ -145,57 +136,73 @@ def _ack_crc(proto: int, serial: bytes) -> bytes:
     return b"\x78\x78" + body + crc.to_bytes(2, "big") + b"\x0D\x0A"
 
 def _ack_sum(proto: int, serial: bytes) -> bytes:
+    """ACK com checksum de 1 byte (soma): 78 78 05 <proto> <serial_hi> <serial_lo> <CS> 0D 0A"""
     if len(serial) != 2:
         serial = serial[:2].rjust(2, b"\x00")
     body = bytes([0x05, proto]) + serial
-    cs = _sum_cs(body)  # vários clones usam soma direta do body
+    cs = _sum_cs(body)
     return b"\x78\x78" + body + bytes([cs]) + b"\x0D\x0A"
 
 def _loc_cs_style(buf: bytearray, i: int) -> Optional[Tuple[int, int]]:
     """
-    Detecta o comprimento total do frame e o 'estilo' do checksum:
-      - Retorna (frame_len, cs_len) com cs_len ∈ {1,2}
-      - Procura 0D 0A após len e payload.
-    Formato geral:
-      78 78 | len(1) | payload(len) | cs(1 ou 2) | 0D 0A
+    Localiza o frame pelo terminador 0D0A e infere cs_len (1 ou 2).
+    Retorna (end, cs_len) onde 'end' é o índice EXCLUSIVO do fim do frame.
     """
     if len(buf) < i + 3:
         return None
-    ln = buf[i + 2]
-    end_cs1 = i + 2 + 1 + ln + 1 + 2   # cs 1B + CRLF
-    end_crc = i + 2 + 1 + ln + 2 + 2   # cs 2B + CRLF
-    if len(buf) >= end_cs1 and buf[end_cs1-2:end_cs1] == b"\x0D\x0A":
-        return (end_cs1, 1)
-    if len(buf) >= end_crc and buf[end_crc-2:end_crc] == b"\x0D\x0A":
-        return (end_crc, 2)
-    return None
+    # procura 0D0A depois de '78 78 len'
+    search_from = i + 4
+    tail = buf.find(b"\x0D\x0A", search_from)
+    if tail < 0:
+        return None
+    end = tail + 2
+    # bytes entre 'len' e checksum (sem CRLF)
+    between_len_and_tail = end - (i + 3) - 2
+    # default conservador (seu aparelho usa SUM=1B)
+    cs_len = 1
+    # heurística branda para aceitar CRC=2 quando plausível
+    for candidate in (2, 1):
+        body_len = between_len_and_tail - candidate
+        if body_len >= 3:  # ao menos proto(1)+serial(2)
+            cs_len = candidate
+            break
+    return (end, cs_len)
 
-def _gt06_validate(pkt: bytes, cs_len: int) -> bool:
+def _gt06_validate_by_body(pkt: bytes, end: int, cs_len: int) -> bool:
+    """Valida checksum contra o 'body' (entre len e checksum), sem depender do len declarativo."""
     if not VALIDATE_GT06_CRC:
         return True
-    ln = pkt[2]
-    payload = pkt[3 : 3 + ln]
+    # body: bytes entre 'len' e o checksum
+    body = pkt[3 : end - (cs_len + 2)]
     if cs_len == 2:
-        got = int.from_bytes(pkt[3 + ln : 3 + ln + 2], "big")
-        return got == _crc16_x25(payload)
+        got = int.from_bytes(pkt[end - 2 - cs_len : end - 2], "big")
+        return got == _crc16_x25(body)
     else:
-        got = pkt[3 + ln]
-        return got == (_sum_cs(payload) & 0xFF)
+        got = pkt[end - 2 - cs_len]
+        return got == (_sum_cs(body) & 0xFF)
 
 def _gt06_parse_position(core: bytes):
-    """Payload SEM serial (proto + campos), para 0x12/0x10."""
+    """
+    Payload SEM serial (proto + campos), para 0x12/0x10:
+      [0]    proto (0x12/0x10)
+      [1:7]  YY MM DD hh mm ss
+      [7]    sat/status
+      [8:12] lat_raw (1/1_800_000)
+      [12:16] lon_raw (1/1_800_000)
+      [16]   speed_kmh
+      [17:19] course/status (10 bits de rumo)
+    """
     if len(core) < 19:
         return None
-    proto = core[0]
-    if proto not in (0x12, 0x10):
+    if core[0] not in (0x12, 0x10):
         return None
     yy, mm, dd, hh, mi, ss = core[1:7]
     try:
         dt = datetime(2000 + yy, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
     except ValueError:
         dt = datetime.now(timezone.utc)
-    lat_raw = int.from_bytes(core[8:12], "big", signed=False)
-    lon_raw = int.from_bytes(core[12:16], "big", signed=False)
+    lat_raw = int.from_bytes(core[8:12], "big")
+    lon_raw = int.from_bytes(core[12:16], "big")
     lat = lat_raw / 1800000.0
     lon = lon_raw / 1800000.0
     spd_knots = core[16] * 0.539957  # km/h → nós
@@ -264,11 +271,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             if not chunk:
                 logger.info("[TRV/GT06] %s desconectou", peer)
                 break
-            # debug do que chegou
+
+            # debug bruto do que chegou
             logger.info("[GT06] CHUNK %dB from %s: %s", len(chunk), peer, chunk.hex(" "))
             buf += chunk
 
-            # 1) GT06 (binário)
+            # 1) GT06 (binário, detectado por 0x78 0x78 ... 0D 0A)
             while True:
                 i = buf.find(b"\x78\x78")
                 if i < 0 or len(buf) < i + 3:
@@ -276,42 +284,59 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
                 det = _loc_cs_style(buf, i)
                 if det is None:
-                    break  # incompleto, aguardar mais bytes
+                    break  # aguarda mais bytes
                 end, cs_len = det
 
                 pkt = bytes(buf[i:end])
                 del buf[:end]
 
-                ln = pkt[2]
-                payload = pkt[3 : 3 + ln]  # inclui proto ... serial(2)
-                proto = payload[0]
-                serial = payload[-2:]
-
-                if not _gt06_validate(pkt, cs_len):
-                    logger.warning("[GT06] Checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
+                # body: tudo entre 'len' e o checksum
+                body = pkt[3 : end - (cs_len + 2)]
+                if len(body) < 3:
+                    logger.warning("[GT06] body muito curto: %s", pkt.hex(" "))
                     continue
 
-                logger.info("[GT06] RX proto=0x%02X len=%d cs_len=%d from=%s", proto, ln, cs_len, peer)
+                if not _gt06_validate_by_body(pkt, end, cs_len):
+                    logger.warning("[GT06] checksum invalido (cs_len=%d) de %s: %s", cs_len, peer, pkt.hex(" "))
+                    continue
+
+                proto = body[0]
+                serial = body[-2:]
+                logger.info("[GT06] RX proto=0x%02X body_len=%d cs_len=%d from=%s",
+                            proto, len(body), cs_len, peer)
 
                 # 0x01 LOGIN
-                if proto == 0x01 and len(payload) >= 1 + 8 + 2:
-                    imei_bcd = payload[1:9]
-                    gt06_imei = _gt06_bcd_imei(imei_bcd)
+                if proto == 0x01:
+                    # Tolerante a variantes onde '0x08' e/ou IMEI vêm truncados
+                    imei = ""
+                    if len(body) >= 2:
+                        maybe_len = body[1]
+                        # bytes entre o suposto 'len' e o serial
+                        rest = body[2:-2] if len(body) > 4 else b""
+                        if maybe_len in (0x08, 0x0F) and len(rest) >= 1:
+                            imei_bcd = rest  # pegue o que houver (alguns clones enviam menos do que declaram)
+                        else:
+                            # Variante curta: trate todo miolo como IMEI BCD
+                            imei_bcd = body[1:-2]
+                        imei = _gt06_bcd_imei(imei_bcd) if imei_bcd else ""
+
+                    if not imei:
+                        imei = "UNKNOWN_GT06"
 
                     # nunca bloqueie o ACK por falha de BD
                     try:
-                        await _ensure_device_safe(gt06_imei, "gt06", "gf22")
+                        await _ensure_device_safe(imei, "gt06", "gf22")
                     except Exception as e:
                         logger.exception("[GT06] ensure_device (safe) falhou: %s", e)
 
                     if peer_ip:
-                        _gt06_peer_cache[peer_ip] = gt06_imei
+                        _gt06_peer_cache[peer_ip] = imei
 
                     ack = _ack_sum(0x01, serial) if cs_len == 1 else _ack_crc(0x01, serial)
                     try:
                         writer.write(ack); await writer.drain()
                         logger.info("[GT06] LOGIN imei=%s serial=%02X%02X TX_ACK=%s (mode=%s)",
-                                    gt06_imei, serial[0], serial[1], ack.hex(" "),
+                                    imei, serial[0], serial[1], ack.hex(" "),
                                     "SUM" if cs_len == 1 else "CRC")
                     except Exception as e:
                         logger.exception("[GT06] Falha ao enviar ACK LOGIN: %s", e)
@@ -320,11 +345,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 elif proto == 0x08:
                     ack = _ack_sum(0x08, serial) if cs_len == 1 else _ack_crc(0x08, serial)
                     writer.write(ack); await writer.drain()
-                    logger.info("[GT06] HEARTBEAT TX_ACK=%s (mode=%s)", ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
+                    logger.info("[GT06] HEARTBEAT TX_ACK=%s (mode=%s)",
+                                ack.hex(" "), "SUM" if cs_len == 1 else "CRC")
 
                 # 0x12/0x10 POSIÇÃO
                 elif proto in (0x12, 0x10):
-                    core = payload[:-2]  # remove serial
+                    core = body[:-2]  # remove serial do final do body
                     parsed = _gt06_parse_position(core)
                     if parsed:
                         lat, lon, spd_knots, crs, dt = parsed
