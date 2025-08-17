@@ -91,19 +91,35 @@ def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: st
 # ============================
 # Utils
 # ============================
+def _bcd_to_int(b: int) -> int:
+    # Converte um byte BCD (ex.: 0x25 -> 25)
+    return ((b >> 4) & 0x0F) * 10 + (b & 0x0F)
+
 def parse_datetime_bcd(dt6: bytes) -> datetime:
     if len(dt6) < 6:
         return datetime.now(timezone.utc)
-    yy, mm, dd, hh, mi, ss = dt6[:6]
-    year = 2000 + (yy % 100)
-    try:
-        return datetime(year, mm, dd, hh, mi, ss, tzinfo=timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
 
-def _decode_bcd_pairs(b: bytes) -> str:
-    # Converte bytes BCD em string de dígitos (dois dígitos por byte)
-    return ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
+    yy, mm, dd, hh, mi, ss = dt6[:6]
+
+    try:
+        year   = 2000 + _bcd_to_int(yy)
+        month  = _bcd_to_int(mm)
+        day    = _bcd_to_int(dd)
+        hour   = _bcd_to_int(hh)
+        minute = _bcd_to_int(mi)
+        second = _bcd_to_int(ss)
+
+        # saneamento básico de faixas
+        if not (1 <= month <= 12):  month = 1
+        if not (1 <= day   <= 31):  day   = 1
+        if hour   > 23:             hour   = 0
+        if minute > 59:             minute = 0
+        if second > 59:             second = 0
+
+        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+    except Exception:
+        # fallback seguro
+        return datetime.now(timezone.utc)
 
 def decode_bcd_imei(imei_bcd: bytes) -> str:
     """
