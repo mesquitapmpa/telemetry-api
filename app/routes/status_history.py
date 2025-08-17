@@ -1,77 +1,80 @@
-# app/routes/status_history.py
-from typing import List, Optional, Literal
-from datetime import datetime
-import inspect
+# app/api/status_history.py
+from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from typing import Optional, Literal
+from datetime import datetime
 
-router = APIRouter(tags=["status"])
+router = APIRouter(prefix="/devices", tags=["devices"])
 
-class DeviceStatusOut(BaseModel):
-    when: datetime
-    battery_pct: Optional[int] = None
-    gsm_pct: Optional[int] = None
-    charging: Optional[bool] = None
-    acc_on: Optional[bool] = None
-    gps_fix: Optional[bool] = None
-    raw_voltage: Optional[int] = None
-    raw_gsm: Optional[int] = None
+try:
+    from app.usecases.list_device_status import list_device_status
+except Exception as e:
+    raise RuntimeError(f"Faltou implementar list_device_status: {e}")
 
-async def _call_maybe_async(fn, *args, **kwargs):
-    res = fn(*args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
+Order = Literal["asc", "desc"]
 
-@router.get("/devices/{key}/status-history", response_model=List[DeviceStatusOut])
-async def status_history(
-    key: str,  # pode ser device_id ou imei (gravamos em ambos)
-    since: Optional[datetime] = Query(None, description="Filtra a partir desta data/hora (UTC/ISO)"),
-    until: Optional[datetime] = Query(None, description="Filtra até esta data/hora (UTC/ISO)"),
-    limit: int = Query(100, ge=1, le=1000),
-    order: Literal["asc", "desc"] = Query("desc"),
-):
-    """
-    Retorna histórico de status do dispositivo.
-    Backend padrão: buffer em memória preenchido por trv._save_status_efficient.
-    Se 'list_device_status' existir em app.usecases, usa-o (banco) automaticamente.
-    """
-    # Se existir um usecase de banco, use-o
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
     try:
-        from app.usecases.list_device_status import list_device_status  # opcional
-        rows = await _call_maybe_async(
-            list_device_status, key=key, since=since, until=until, limit=limit, order=order
-        )
-        # Espera-se que rows seja iterável de dicts compatíveis; se necessário, adapte aqui.
-        return rows
+        # aceita ...Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
     except Exception:
-        # fallback para buffer em memória
-        pass
+        raise HTTPException(
+            status_code=400,
+            detail="Parâmetro de data inválido. Use ISO 8601, ex.: 2025-08-17T14:00:00Z",
+        )
 
-    # Fallback: STATUS_HISTORY (memória)
-    try:
-        from app.protocols.trv import STATUS_HISTORY
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STATUS_HISTORY não acessível: {e}")
+@router.get("/{device_key}/status-history")
+async def status_history_by_key(
+    device_key: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    order: Order = "desc",
+):
+    items = await list_device_status(
+        key=device_key,
+        since=_parse_dt(since),
+        until=_parse_dt(until),
+        limit=limit,
+        order=order,
+    )
+    return {"device": device_key, "count": len(items), "items": items}
 
-    items = list(STATUS_HISTORY.get(key, []))
-    if not items:
-        # tenta também a outra chave (se veio imei, tenta como device_id e vice-versa)
-        # não sabemos mapear aqui; então apenas retorna vazio se não houver
-        return []
+@router.get("/imei/{imei}/status-history")
+async def status_history_by_imei(
+    imei: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    order: Order = "desc",
+):
+    items = await list_device_status(
+        key=imei,
+        since=_parse_dt(since),
+        until=_parse_dt(until),
+        limit=limit,
+        order=order,
+    )
+    return {"device": imei, "count": len(items), "items": items}
 
-    # filtros
-    if since:
-        items = [x for x in items if x["when"] >= since]
-    if until:
-        items = [x for x in items if x["when"] <= until]
-
-    # ordenação
-    items.sort(key=lambda x: x["when"], reverse=(order == "desc"))
-
-    # corte
-    items = items[:limit]
-
-    # Pydantic converte dict->model
-    return items
+@router.get("/id/{device_id}/status-history")
+async def status_history_by_id(
+    device_id: str,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    order: Order = "desc",
+):
+    items = await list_device_status(
+        key=device_id,
+        since=_parse_dt(since),
+        until=_parse_dt(until),
+        limit=limit,
+        order=order,
+    )
+    return {"device": device_id, "count": len(items), "items": items}
