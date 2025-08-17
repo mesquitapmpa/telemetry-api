@@ -19,14 +19,12 @@ async def ensure_device(imei: str, protocol: str = "trv", model: str = "gf22") -
 async def save_position(imei: str, lat: float, lon: float, fix_time: datetime | None,
                         speed_knots: float, course_deg: float, valid: bool, raw: str):
     
-    if fix_time is None:
-        fix_time = datetime.now(timezone.utc)
     
     dev = await ensure_device(imei)
     async with AsyncSessionLocal() as sess:
         pos = Position(
             device_id=dev.id,
-            fix_time=fix_time or datetime.now(timezone.utc),
+            fix_time=datetime.now(timezone.utc),
             latitude=lat, longitude=lon,
             speed_knots=speed_knots,
             speed_kmh=round(speed_knots * KNOT_TO_KMH, 3),   # NOVO
