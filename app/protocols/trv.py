@@ -96,14 +96,11 @@ def _decode_bcd_pairs(b: bytes) -> str:
 
 def decode_bcd_imei(imei_bcd: bytes) -> str:
     """
-    Decodifica IMEI BCD de 8 bytes (formato GT06 clássico).
+    Decodifica IMEI BCD de 8 bytes (formato GT06).
+    Regra: remover APENAS o primeiro '0' inicial (nibble alto de 0x08), preservando zeros legítimos.
     Ex.: b'\x08\x61\x26\x10\x29\x74\x03\x19' -> '861261029740319'
-    Regra: remover apenas o primeiro nibble '0' (caractere '0' inicial) se existir,
-    preservando zeros legítimos subsequentes.
     """
-    s = _decode_bcd_pairs(imei_bcd)  # p.ex: '0861261029740319'
-    # Remover APENAS o primeiro caractere '0' (nibble alto de 0x08),
-    # não use lstrip('0') para não cortar zeros válidos.
+    s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)  # p.ex.: '0861261029740319'
     if s and s[0] == '0':
         s = s[1:]
     return s[:15]
@@ -295,7 +292,23 @@ def _detect_checksum_from_raw(raw: bytes) -> Tuple[str, bytes, bytes]:
             serial = rest[-3:-1] if len(rest) >= 3 else b"\x00\x00"
             return ("SUM8", serial, msg_type_b + rest[:-1])
 
-    return ("TRUNC", b"", msg_type_b + rest)
+    # --- TRUNC ---
+    # Heurística para recuperar SERIAL em frames sem checksum reconhecido.
+    # Útil no LOGIN (0x01) de alguns clones que omitem CRC/SUM.
+    serial_guess = b""
+    try:
+        msg_t = msg_type_b[0]
+        if msg_t == 0x01:
+            # Com CRC no login: 0x01 + IMEI(8) + SERIAL(2) + CRC(2)  -> len(rest) >= 12, length ~ 0x0D
+            if len(rest) >= 12 and length in (0x0D, 13):
+                serial_guess = rest[-4:-2]
+            # Sem CRC no login: 0x01 + IMEI(8) + SERIAL(2)           -> len(rest) >= 10
+            elif len(rest) >= 10:
+                serial_guess = rest[-2:]
+    except Exception:
+        pass
+
+    return ("TRUNC", serial_guess, msg_type_b + rest)
 
 async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer: str, state: ConnState):
     buf = bytearray()
