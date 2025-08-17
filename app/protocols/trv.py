@@ -1,5 +1,6 @@
 # app/protocols/trv.py
 import asyncio
+import socket
 import struct
 import binascii
 import logging
@@ -329,6 +330,12 @@ def _detect_checksum_from_raw(raw: bytes) -> Tuple[str, bytes, bytes]:
             # Clones TRUNC com SERIAL de 1 byte: 0x01 + IMEI(8) + SERIAL(1) -> len(rest) >= 9
             elif len(rest) >= 9:
                 serial_guess = rest[-1:]       # 1 byte
+        
+        elif msg_t == 0x13:
+            # Heartbeat TRUNC: muitos clones colocam o SERIAL nos 2 últimos bytes do body
+            # Exemplo do seu frame: 78 78 07 13 5B 60 08 19 37 0D 0A  -> serial = 0x19 0x37
+            if len(rest) >= 2:
+                serial_guess = rest[-2:]
     except Exception:
         pass
 
@@ -463,26 +470,107 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
     logger.info("[GT06] POS salva device_id=%s lat=%.6f lon=%.6f v=%.1f km/h curso=%.1f valid=%s",
                 state.device["id"], gps["lat"], gps["lon"], gps["speed_kmh"], gps["course"], gps["valid"])
 
+def _set_tcp_keepalive(sock, idle=30, interval=10, count=3, user_timeout_ms=45000):
+    """
+    Liga keepalive no socket de forma portátil.
+    idle/interval/count em segundos (user_timeout em ms, Linux).
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception as e:
+        logger.debug("[GT06] SO_KEEPALIVE falhou: %s", e)
+
+    plat = sys.platform
+
+    # --- Linux ---
+    if plat.startswith("linux"):
+        def _try_opt(opt_name, val):
+            opt = getattr(socket, opt_name, None)
+            if opt is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+                except Exception as e:
+                    logger.debug("[GT06] %s falhou: %s", opt_name, e)
+
+        _try_opt("TCP_KEEPIDLE", idle)
+        _try_opt("TCP_KEEPINTVL", interval)
+        _try_opt("TCP_KEEPCNT", count)
+
+        # TCP_USER_TIMEOUT (ms) – pode não existir; em muitos sistemas é 18
+        opt_user_to = getattr(socket, "TCP_USER_TIMEOUT", 18)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt_user_to, user_timeout_ms)
+        except Exception as e:
+            logger.debug("[GT06] TCP_USER_TIMEOUT falhou: %s", e)
+
+    # --- macOS ---
+    elif plat == "darwin":
+        opt = getattr(socket, "TCP_KEEPALIVE", None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, idle)
+            except Exception as e:
+                logger.debug("[GT06] TCP_KEEPALIVE (macOS) falhou: %s", e)
+
+    # --- Windows ---
+    elif plat == "win32":
+        # Usa SIO_KEEPALIVE_VALS: (onoff, keepalivetime_ms, keepaliveinterval_ms)
+        import struct as _struct
+        SIO_KEEPALIVE_VALS = 0x98000004
+        try:
+            sock.ioctl(SIO_KEEPALIVE_VALS, _struct.pack("III", 1, idle * 1000, interval * 1000))
+        except Exception as e:
+            logger.debug("[GT06] SIO_KEEPALIVE_VALS falhou: %s", e)
+
+    # --- Outros (BSDs etc.) ---
+    else:
+        for name, val in (
+            ("TCP_KEEPIDLE", idle),
+            ("TCP_KEEPINTVL", interval),
+            ("TCP_KEEPCNT", count),
+            ("TCP_KEEPALIVE", idle),
+        ):
+            opt = getattr(socket, name, None)
+            if opt is None:
+                continue
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+            except Exception as e:
+                logger.debug("[GT06] %s falhou: %s", name, e)
+
 # ============================
 # Server
 # ============================
 async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # --- socket options (keepalive) ---
+  
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        _set_tcp_keepalive(sock, idle=30, interval=10, count=3, user_timeout_ms=45000)
+
     peer = writer.get_extra_info("peername")
     logger.info("[TRV/GT06] Conexao de %s", peer)
     state = ConnState()
     try:
         await _frame_loop(reader, writer, str(peer), state)
-    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-        # término normal quando o dispositivo fecha a conexão
-        pass
+
+    except asyncio.IncompleteReadError:
+        # EOF do peer: ele fechou primeiro
+        logger.info("[TRV/GT06] Peer encerrou a conexao: %s", peer)
+
+    except (ConnectionResetError, BrokenPipeError):
+        logger.info("[TRV/GT06] Conexao resetada/quebrada: %s", peer)
+
     except Exception as e:
         logger.exception("[GT06] erro: %s", e)
+
     finally:
         try:
             writer.close()
             await writer.wait_closed()
         except Exception:
             pass
+        logger.info("[TRV/GT06] Conexao finalizada: %s", peer)
 
 async def run(port: int = 5010):
     server = await asyncio.start_server(gt06_server, "0.0.0.0", port)
