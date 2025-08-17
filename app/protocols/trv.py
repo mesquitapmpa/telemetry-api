@@ -105,12 +105,17 @@ def decode_bcd_imei(imei_bcd: bytes) -> str:
         s = s[1:]
     return s[:15]
 
+def _is_bcd_digits(b: bytes) -> bool:
+    # True se todos os nibbles forem 0–9 (evita “falsos positivos” no fallback)
+    return all((((x >> 4) & 0xF) <= 9 and (x & 0xF) <= 9) for x in b)
+
 def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     """
     Extrai IMEI do payload do login:
-    - Formato ASCII: 0x0F + 15 dígitos.
-    - Formato BCD:   0x08 + 8 bytes BCD, onde o primeiro nibble é '0' e o segundo '8'.
-    Fallback: varre janelas de 8 bytes tentando decodificar IMEI BCD válido.
+    - ASCII: 0x0F + 15 dígitos
+    - BCD:   0x08 + 8 bytes BCD
+    - Fallback robusto: procura uma janela de 8 bytes BCD cujo 1º nibble seja 0 e o 2º nibble seja 8,
+      que é o padrão de login BCD do GT06 (0x08 ...).
     """
     if not payload:
         return None
@@ -124,17 +129,32 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # BCD 0x08
+    # BCD 0x08 (caminho principal)
     if payload[:1] == b"\x08" and len(payload) >= 9:
         s = decode_bcd_imei(payload[1:9])
         if s.isdigit() and len(s) == 15:
             return s
 
-    # fallback: varre janelas (último recurso; mantém regra “remove só 1º nibble 0”)
+    # -------- Fallback robusto --------
+    # 1) Procura a janela “clássica”: 8 bytes BCD começando por 0x08 (nibble alto=0, baixo=8).
     for i in range(0, max(0, len(payload) - 7)):
-        s = decode_bcd_imei(payload[i:i+8])
+        win = payload[i:i+8]
+        if not _is_bcd_digits(win):
+            continue
+        if ((win[0] >> 4) & 0xF) == 0x0 and (win[0] & 0xF) == 0x8:
+            s = decode_bcd_imei(win)
+            if s.isdigit() and len(s) == 15:
+                return s
+
+    # 2) Se não achou, aceita a primeira janela BCD válida (menos rigorosa, mas evita desalinhamento).
+    for i in range(0, max(0, len(payload) - 7)):
+        win = payload[i:i+8]
+        if not _is_bcd_digits(win):
+            continue
+        s = decode_bcd_imei(win)
         if s.isdigit() and len(s) == 15:
             return s
+
     return None
 
 def parse_gps_basic(payload: bytes) -> Optional[dict]:
