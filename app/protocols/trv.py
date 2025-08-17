@@ -7,11 +7,16 @@ import binascii
 import logging
 import os
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any
 
 from app.usecases.save_position import save_position
 from app.usecases.device_helpers import ensure_device_canonical
+
+try:
+    from app.usecases.save_device_status import save_device_status
+except Exception:
+    save_device_status = None
 
 logger = logging.getLogger("trv_gt06")
 if not logger.handlers:
@@ -107,6 +112,57 @@ def decode_bcd_imei(imei_bcd: bytes) -> str:
     if s and s[0] == '0':  # caso '08...'
         s = s[1:]
     return s[:15]          # garante 15 dígitos
+
+# ============================
+# Status (battery/GSM) utils
+# ============================
+def _map_voltage_to_percent(v: int) -> Optional[int]:
+    """
+    GT06 manda 'Voltage' como nível 0..6 ou já como 0..100 (clones).
+    """
+    if v is None:
+        return None
+    if 0 <= v <= 100:
+        return v
+    if 0 <= v <= 6:
+        return {0: 0, 1: 5, 2: 15, 3: 40, 4: 60, 5: 80, 6: 100}.get(v)
+    return None
+
+def _map_gsm_to_percent(g: int) -> Optional[int]:
+    """
+    GSM pode vir 0..4 (básico) ou 0..31 (RSSI). Converte para %.
+    """
+    if g is None:
+        return None
+    if 0 <= g <= 4:
+        return {0: 0, 1: 20, 2: 40, 3: 60, 4: 100}[g]
+    if 0 <= g <= 31:
+        return int(round(g * 100.0 / 31.0))
+    if 0 <= g <= 100:
+        return g
+    return None
+
+def parse_status_heartbeat(payload: bytes) -> Optional[dict]:
+    """
+    Para 0x13 (heartbeat): 3 primeiros bytes são:
+      [TerminalInfo][Voltage][GSM]  ... (resto pode ter alarm/lang + serial)
+    """
+    if len(payload) < 3:
+        return None
+    ti, volt, gsm = payload[0], payload[1], payload[2]
+    return {
+        "terminal_info": ti,
+        "gps_fix": bool(ti & (1 << 6)),
+        "charging": bool(ti & (1 << 2)),
+        "acc_on": bool(ti & (1 << 1)),
+        "activated": bool(ti & 1),
+        "alarm_code": (ti >> 3) & 0b111,
+        "battery_pct": _map_voltage_to_percent(volt),
+        "gsm_pct": _map_gsm_to_percent(gsm),
+        "raw_voltage": volt,
+        "raw_gsm": gsm,
+    }
+
 
 def _is_bcd_digits(b: bytes) -> bool:
     # True se todos os nibbles forem 0–9 (evita “falsos positivos” no fallback)
@@ -270,6 +326,51 @@ async def _save_position_compat(state_device: Dict[str, Any], gps: Dict[str, Any
         imei, lat, lon, fix_time, speed_knots, course_deg, valid, raw_hex
     )
 
+
+async def _save_status_efficient(state_device: Dict[str, Any], st: Dict[str, Any], now: datetime):
+    """
+    Salva status com economia: apenas quando mudar OU a cada 5 minutos.
+    Usa save_device_status se disponível; caso contrário, só loga.
+    """
+    if not state_device:
+        return
+
+    cache = state_device.setdefault("_status_cache", {"last": None, "ts": None})
+    last, last_ts = cache["last"], cache["ts"]
+
+    cur = (st.get("battery_pct"), st.get("gsm_pct"),
+           st.get("charging"), st.get("acc_on"), st.get("gps_fix"))
+    changed = (last != cur)
+    timeout = (last_ts is None) or (now - last_ts >= timedelta(minutes=5))
+    if not changed and not timeout:
+        return
+
+    try:
+        if save_device_status:
+            await _call_maybe_async(
+                save_device_status,
+                imei=state_device.get("imei"),
+                device_id=state_device.get("id"),
+                battery_pct=st.get("battery_pct"),
+                gsm_pct=st.get("gsm_pct"),
+                charging=st.get("charging"),
+                acc_on=st.get("acc_on"),
+                gps_fix=st.get("gps_fix"),
+                raw_voltage=st.get("raw_voltage"),
+                raw_gsm=st.get("raw_gsm"),
+                when=now,
+            )
+        logger.info("[GT06] STATUS device_id=%s bat=%s%% gsm=%s%% charge=%s acc=%s gps=%s (volt=0x%02X gsm_raw=0x%02X)",
+                    state_device.get("id"),
+                    st.get("battery_pct"), st.get("gsm_pct"),
+                    st.get("charging"), st.get("acc_on"), st.get("gps_fix"),
+                    st.get("raw_voltage") or 0, st.get("raw_gsm") or 0)
+    except Exception as e:
+        logger.exception("[GT06] Falha ao salvar status: %s", e)
+
+    cache["last"] = cur
+    cache["ts"] = now
+
 # ============================
 # Deframer por buffer
 # ============================
@@ -424,6 +525,8 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 elif msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
                     await handle_gps(payload, binascii.hexlify(raw).decode().upper(), state)
                 # 0x13/0x08/0x30/0x80 -> só ACK acima (mantido)
+                elif msg_type == 0x13:
+                    await handle_status(payload, binascii.hexlify(raw).decode().upper(), state)
             except Exception as e:
                 logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
@@ -470,6 +573,26 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
     await _save_position_compat(state.device, gps, raw_hex)
     logger.info("[GT06] POS salva device_id=%s lat=%.6f lon=%.6f v=%.1f km/h curso=%.1f valid=%s",
                 state.device["id"], gps["lat"], gps["lon"], gps["speed_kmh"], gps["course"], gps["valid"])
+
+async def handle_status(payload: bytes, raw_hex: str, state: ConnState):
+    st = parse_status_heartbeat(payload)
+    if not st:
+        logger.warning("[GT06] STATUS payload curto/indecifrável: %s", binascii.hexlify(payload).decode().upper())
+        return
+
+    # garante device canônico
+    if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) == 15:
+        try:
+            dev = await ensure_device_canonical("gt06", state.imei_seen)
+            state.device = _device_as_dict(dev)
+        except Exception:
+            pass
+
+    if not state.device:
+        logger.warning("[GT06] Sem device canônico; descartando status.")
+        return
+
+    await _save_status_efficient(state.device, st, datetime.now(timezone.utc))
 
 def _set_tcp_keepalive(sock, idle=30, interval=10, count=3, user_timeout_ms=45000):
     """

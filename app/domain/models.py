@@ -1,6 +1,8 @@
 from app.infra.db import Base
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Boolean, ForeignKey, DateTime, Float, Text, Index
+from typing import Optional, List
+from sqlalchemy import String, Boolean, ForeignKey, DateTime, Float, Text, Index, Integer  # <-- Integer
+from typing import Optional, List
 from datetime import datetime, timezone
 import uuid
 
@@ -15,7 +17,46 @@ class Device(Base):
     model: Mapped[str] = mapped_column(String(64), default="unknown")
     protocol: Mapped[str] = mapped_column(String(32), default="trv")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    positions: Mapped[list["Position"]] = relationship("Position", back_populates="device")
+
+    # --- NOVO: snapshot de status corrente ---
+    battery_pct: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    gsm_pct:     Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    charging:    Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    acc_on:      Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    gps_fix:     Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    status_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    positions: Mapped[List["Position"]] = relationship("Position", back_populates="device")
+
+    # (Opcional) relação com histórico
+    status_history: Mapped[List["DeviceStatusHistory"]] = relationship(
+        "DeviceStatusHistory",
+        back_populates="device",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+class DeviceStatusHistory(Base):
+    __tablename__ = "device_status_history"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    device_id: Mapped[str] = mapped_column(String(36), ForeignKey("devices.id"), index=True)
+
+    when: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+    battery_pct: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    gsm_pct:     Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    charging:    Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    acc_on:      Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    gps_fix:     Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    raw_voltage: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    raw_gsm:     Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    device: Mapped["Device"] = relationship("Device", back_populates="status_history")
+
+    __table_args__ = (
+        Index("idx_device_status_history_device_when", "device_id", "when"),
+    )
 
 class Position(Base):
     __tablename__ = "positions"
