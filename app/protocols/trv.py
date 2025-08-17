@@ -8,13 +8,22 @@ import os
 import inspect
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any
-
+from typing import Optional, Tuple, Dict, Any, List
 from app.usecases.save_position import save_position
 from app.usecases.device_helpers import ensure_device_canonical
+from __future__ import annotations
 
 logger = logging.getLogger(__name__)  # ou "trv_gt06"
 logger.setLevel(logging.INFO)
+
+try:
+    # você implementa isso (MLS/Google/etc). Assinatura sugerida:
+    # async def geolocate_network(wifi: List[dict], cells: List[dict], mcc: int|None, mnc: int|None) -> Optional[dict]
+    # retorna: {"lat": float, "lon": float, "accuracy": float, "provider": "MLS|Google|..." }
+    from app.usecases.geolocate_network import geolocate_network  # type: ignore
+except Exception as e:
+    geolocate_network = None
+    logger.warning("[GT06] geolocate_network indisponível: %s", e)
 
 try:
     from app.usecases.save_device_status import save_device_status  # agora é async
@@ -266,6 +275,113 @@ def parse_gps_basic(payload: bytes) -> Optional[dict]:
         "raw_flags": cflags,
     }
 
+# --- adicione depois de parse_gps_basic(...) ---
+def _read_int8(b: int) -> int:
+    return b - 256 if b > 127 else b
+
+def parse_net_1a_1b(payload: bytes) -> Optional[dict]:
+    """
+    Decodifica quadros 'network' (vários clones GT06):
+      [time6][wifi*][cells]
+    Heurística robusta:
+      - Wi-Fi: repetição de [MAC6][RSSI1 signed]
+      - Células: [count1][MCC2][MNC1][(opcional) 0x0000][ (LAC2)(CID4)(RSSI1) * count ]
+    Retorna dict: {"time", "wifi": [{"bssid","rssi"}...], "cells":[{"lac","cid","rssi"}...], "mcc","mnc"}
+    """
+    if len(payload) < 6:
+        return None
+    dt = parse_datetime_bcd(payload[0:6])
+    i = 6
+    wifi: List[dict] = []
+
+    # tenta acumular Wi-Fi até detectar cabeçalho de células
+    while i + 7 <= len(payload):
+        # tentativa de detectar início do bloco de células
+        rem = len(payload) - i
+        if rem >= 4:
+            cnt = payload[i]
+            mcc_guess = int.from_bytes(payload[i+1:i+3], "big")
+            mnc_guess = payload[i+3]
+            # candidato plausível: 1..16 células, MCC 200..999, MNC 0..255
+            if 0 < cnt <= 16 and 200 <= mcc_guess <= 999:
+                # calcula offset real (alguns firmwares colocam 2 bytes 0x0000 após MNC)
+                cell_off = i + 4
+                if rem - 4 < cnt * 7 and rem >= 6 and payload[i+4:i+6] == b"\x00\x00":
+                    cell_off = i + 6
+                # parse das células
+                cells = []
+                j = cell_off
+                for _ in range(cnt):
+                    # aceita 7..8 bytes por registro (às vezes um 0x00 de padding)
+                    if j + 7 > len(payload):
+                        break
+                    lac = int.from_bytes(payload[j:j+2], "big")
+                    cid = int.from_bytes(payload[j+2:j+6], "big")
+                    rssi = _read_int8(payload[j+6])
+                    cells.append({"lac": lac, "cid": cid, "rssi": rssi})
+                    j += 7
+                    if j < len(payload) and payload[j] == 0x00:
+                        j += 1  # padding opcional
+                return {"time": dt, "wifi": wifi, "cells": cells, "mcc": mcc_guess, "mnc": mnc_guess}
+
+        # se não é células, tratamos como mais um AP Wi-Fi
+        mac = payload[i:i+6]
+        if len(mac) < 6:
+            break
+        rssi = _read_int8(payload[i+6])
+        wifi.append({"bssid": ":".join(f"{x:02X}" for x in mac), "rssi": rssi})
+        i += 7
+
+    return {"time": dt, "wifi": wifi, "cells": [], "mcc": None, "mnc": None}
+
+
+# --- novo handler ---
+async def handle_network(payload: bytes, raw_hex: str, state: ConnState):
+    net = parse_net_1a_1b(payload)
+    if not net:
+        logger.warning("[GT06] NET payload curto/indecifrável: %s", binascii.hexlify(payload).decode().upper())
+        return
+
+    # garante device
+    if not state.device and state.imei_seen and state.imei_seen.isdigit() and len(state.imei_seen) == 15:
+        try:
+            dev = await ensure_device_canonical("gt06", state.imei_seen)
+            state.device = _device_as_dict(dev)
+        except Exception:
+            pass
+    if not state.device:
+        logger.warning("[GT06] Sem device canônico; descartando NET.")
+        return
+
+    wifi, cells, mcc, mnc = net["wifi"], net["cells"], net.get("mcc"), net.get("mnc")
+    logger.info("[GT06] NET: wifi=%d cells=%d mcc=%s mnc=%s", len(wifi), len(cells), mcc, mnc)
+
+    lat = lon = acc = None
+    provider = None
+    if geolocate_network:
+        try:
+            geo = await _call_maybe_async(geolocate_network, wifi=wifi, cells=cells, mcc=mcc, mnc=mnc)
+            if geo and "lat" in geo and "lon" in geo:
+                lat = float(geo["lat"]); lon = float(geo["lon"])
+                acc = float(geo.get("accuracy") or 0.0)
+                provider = str(geo.get("provider") or "network")
+        except Exception as e:
+            logger.exception("[GT06] geolocate_network falhou: %s", e)
+
+    if lat is not None and lon is not None:
+        gps = {
+            "time": net["time"],
+            "lat": lat,
+            "lon": lon,
+            "speed_kmh": 0.0,
+            "course": 0.0,
+            "valid": True,
+        }
+        await _save_position_compat(state.device, gps, raw_hex)
+        logger.info("[GT06] POS(NET) salva device_id=%s lat=%.6f lon=%.6f acc=%s prov=%s",
+                    state.device["id"], lat, lon, (f"{acc:.0f}m" if acc else "—"), provider or "network")
+    else:
+        logger.info("[GT06] NET sem geolocalizador ativo; nada salvo (apenas ACK).")
 # ============================
 # Sessão por conexão
 # ============================
@@ -560,6 +676,9 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                         await _save_status_efficient(state.device, st, now)
 
                 # 0x08/0x30/0x80 → só ACK (já feito acima)
+                elif msg_type in (0x1A, 0x1B):
+                    await handle_network(payload, binascii.hexlify(raw).decode().upper(), state)
+
             except Exception as e:
                 logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
