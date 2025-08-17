@@ -4,19 +4,23 @@ import sys
 import socket
 import struct
 import binascii
-import logging
 import os
 import inspect
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any
 
 from app.usecases.save_position import save_position
 from app.usecases.device_helpers import ensure_device_canonical
 
+logger = logging.getLogger(__name__)  # ou "trv_gt06"
+logger.setLevel(logging.INFO)
+
 try:
-    from app.usecases.save_device_status import save_device_status
-except Exception:
+    from app.usecases.save_device_status import save_device_status  # agora é async
+except Exception as e:
     save_device_status = None
+    logger.warning("[GT06] save_device_status indisponível: %s", e)
 
 logger = logging.getLogger("trv_gt06")
 if not logger.handlers:
@@ -331,6 +335,7 @@ async def _save_status_efficient(state_device: Dict[str, Any], st: Dict[str, Any
     """
     Salva status com economia: apenas quando mudar OU a cada 5 minutos.
     Usa save_device_status se disponível; caso contrário, só loga.
+    O cache fica dentro do dict do device (state_device["_status_cache"]).
     """
     if not state_device:
         return
@@ -359,12 +364,16 @@ async def _save_status_efficient(state_device: Dict[str, Any], st: Dict[str, Any
                 raw_voltage=st.get("raw_voltage"),
                 raw_gsm=st.get("raw_gsm"),
                 when=now,
+                record_history=True,
             )
+
+        rv = 0 if st.get("raw_voltage") is None else int(st.get("raw_voltage")) & 0xFF
+        rg = 0 if st.get("raw_gsm") is None else int(st.get("raw_gsm")) & 0xFF
         logger.info("[GT06] STATUS device_id=%s bat=%s%% gsm=%s%% charge=%s acc=%s gps=%s (volt=0x%02X gsm_raw=0x%02X)",
                     state_device.get("id"),
                     st.get("battery_pct"), st.get("gsm_pct"),
                     st.get("charging"), st.get("acc_on"), st.get("gps_fix"),
-                    st.get("raw_voltage") or 0, st.get("raw_gsm") or 0)
+                    rv, rg)
     except Exception as e:
         logger.exception("[GT06] Falha ao salvar status: %s", e)
 
@@ -522,11 +531,19 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             try:
                 if msg_type == 0x01:
                     await handle_login(payload, binascii.hexlify(raw).decode().upper(), peer, state)
+
                 elif msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
                     await handle_gps(payload, binascii.hexlify(raw).decode().upper(), state)
-                # 0x13/0x08/0x30/0x80 -> só ACK acima (mantido)
+
                 elif msg_type == 0x13:
-                    await handle_status(payload, binascii.hexlify(raw).decode().upper(), state)
+                    # ↳ AQUI chamamos o salvamento do status (bateria/sinal) logo após decodificar
+                    # Assumindo que você já tem parse_status_heartbeat(payload) montando o dict `st`
+                    st = parse_status_heartbeat(payload)
+                    if st and state.device:
+                        now = datetime.now(timezone.utc)
+                        await _save_status_efficient(state.device, st, now)
+
+                # 0x08/0x30/0x80 → só ACK (já feito acima)
             except Exception as e:
                 logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
