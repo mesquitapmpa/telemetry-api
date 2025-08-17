@@ -326,6 +326,9 @@ def _detect_checksum_from_raw(raw: bytes) -> Tuple[str, bytes, bytes]:
             # Sem CRC no login: 0x01 + IMEI(8) + SERIAL(2)           -> len(rest) >= 10
             elif len(rest) >= 10:
                 serial_guess = rest[-2:]
+            # Clones TRUNC com SERIAL de 1 byte: 0x01 + IMEI(8) + SERIAL(1) -> len(rest) >= 9
+            elif len(rest) >= 9:
+                serial_guess = rest[-1:]       # 1 byte
     except Exception:
         pass
 
