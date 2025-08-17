@@ -1,4 +1,5 @@
 # app/protocols/trv.py
+from __future__ import annotations
 import asyncio
 import sys
 import socket
@@ -11,7 +12,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any, List
 from app.usecases.save_position import save_position
 from app.usecases.device_helpers import ensure_device_canonical
-from __future__ import annotations
 
 logger = logging.getLogger(__name__)  # ou "trv_gt06"
 logger.setLevel(logging.INFO)
