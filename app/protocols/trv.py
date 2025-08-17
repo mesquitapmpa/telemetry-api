@@ -100,10 +100,11 @@ def decode_bcd_imei(imei_bcd: bytes) -> str:
     Regra: remover APENAS o primeiro '0' inicial (nibble alto de 0x08), preservando zeros legítimos.
     Ex.: b'\x08\x61\x26\x10\x29\x74\x03\x19' -> '861261029740319'
     """
-    s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)  # p.ex.: '0861261029740319'
-    if s and s[0] == '0':
+    logger.debug("[GT06] IMEI_BCD_RAW=%s", binascii.hexlify(imei_bcd).decode().upper())
+    s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)  # p.ex.: '0861261029740319' ou '8612610297403196'
+    if s and s[0] == '0':  # caso '08...'
         s = s[1:]
-    return s[:15]
+    return s[:15]          # garante 15 dígitos
 
 def _is_bcd_digits(b: bytes) -> bool:
     # True se todos os nibbles forem 0–9 (evita “falsos positivos” no fallback)
@@ -113,9 +114,8 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
     """
     Extrai IMEI do payload do login:
     - ASCII: 0x0F + 15 dígitos
-    - BCD:   0x08 + 8 bytes BCD
-    - Fallback robusto: procura uma janela de 8 bytes BCD cujo 1º nibble seja 0 e o 2º nibble seja 8,
-      que é o padrão de login BCD do GT06 (0x08 ...).
+    - BCD:   8 BYTES diretamente (o 1º byte do IMEI muitas vezes é 0x08 — não é um “marcador”, é o próprio BCD)
+    - Fallback robusto: procura uma janela de 8 bytes BCD começando por 0x08 OU a primeira janela BCD válida.
     """
     if not payload:
         return None
@@ -129,19 +129,20 @@ def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # BCD 0x08 (caminho principal)
-    if payload[:1] == b"\x08" and len(payload) >= 9:
-        s = decode_bcd_imei(payload[1:9])
+    # BCD: muitos firmwares começam com 0x08 no PRIMEIRO byte do IMEI (não é prefixo separado!)
+    # Portanto, se o 1º byte já é BCD (geralmente 0x08 ou 0x86), pegamos os PRIMEIROS 8 BYTES.
+    if len(payload) >= 8 and _is_bcd_digits(payload[0:8]):
+        s = decode_bcd_imei(payload[0:8])
         if s.isdigit() and len(s) == 15:
             return s
 
     # -------- Fallback robusto --------
-    # 1) Procura a janela “clássica”: 8 bytes BCD começando por 0x08 (nibble alto=0, baixo=8).
+    # 1) Procura a janela “clássica”: 8 bytes BCD cujo 1º byte seja 0x08.
     for i in range(0, max(0, len(payload) - 7)):
         win = payload[i:i+8]
         if not _is_bcd_digits(win):
             continue
-        if ((win[0] >> 4) & 0xF) == 0x0 and (win[0] & 0xF) == 0x8:
+        if win[0] == 0x08:
             s = decode_bcd_imei(win)
             if s.isdigit() and len(s) == 15:
                 return s
@@ -419,6 +420,9 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 # Handlers
 # ============================
 async def handle_login(payload: bytes, raw_hex: str, peer: str, state: ConnState):
+    # Logar payload do login ajuda a auditar o alinhamento (deve começar com 08 ou 86 na maioria dos BCDs)
+    logger.info("[GT06] LOGIN payload=%s", binascii.hexlify(payload).decode().upper())
+
     imei = extract_login_imei_from_payload(payload) or ""
     state.imei_seen = imei or state.imei_seen
 
@@ -459,12 +463,6 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
 # ============================
 # Server
 # ============================
-class ConnState:
-    __slots__ = ("device", "imei_seen")
-    def __init__(self):
-        self.device: Optional[Dict[str, Any]] = None
-        self.imei_seen: Optional[str] = None
-
 async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
     logger.info("[TRV/GT06] Conexao de %s", peer)
