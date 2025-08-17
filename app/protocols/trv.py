@@ -31,6 +31,10 @@ def _hex_spaced(b: bytes) -> str:
 # Checksums
 # ============================
 def crc16_x25(data: bytes) -> int:
+    """
+    CRC-16/X25 (CRC-16/IBM-SDLC): init=0xFFFF, poly=0x1021 (refin/refout), xorout=0xFFFF.
+    Aqui implementado pelo clássico 0x8408 em little pass e retorno byte-swapped big-endian.
+    """
     crc = 0xFFFF
     for b in data:
         crc ^= b
@@ -47,8 +51,9 @@ def sum8(data: bytes) -> int:
 # ============================
 def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: str) -> bytes:
     """
+    Constrói ACK compatível com o modo detectado no frame recebido.
     - CRC16: len = 1(type)+2(serial)+2(crc) = 0x05
-    - SUM8/TRUNC: **compat clones** → usamos len = 0x05 também (serial=0000) e 1 byte de SUM.
+    - SUM8/TRUNC: usamos len = 0x05 também (serial=ecoado quando disponível, senão 0000) + 1 byte de SUM8.
     """
     hdr = b"\x78\x78" if header == 0x7878 else b"\x79\x79"
 
@@ -66,7 +71,7 @@ def build_ack(header: int, msg_type: int, serial_bytes: bytes, checksum_mode: st
         crc = crc16_x25(pkt_wo_crc[2:])
         return pkt_wo_crc + struct.pack(">H", crc) + b"\x0D\x0A"
 
-    # SUM8 e TRUNC → responder como SUM com len=0x05 (compat)
+    # SUM8 e TRUNC → responder com SUM8 (compat clones), ecoando serial quando houver
     length = 0x05
     pkt_wo_sum = hdr + bytes([length]) + body
     cs = sum8(pkt_wo_sum[2:])
@@ -85,27 +90,50 @@ def parse_datetime_bcd(dt6: bytes) -> datetime:
     except Exception:
         return datetime.now(timezone.utc)
 
+def _decode_bcd_pairs(b: bytes) -> str:
+    # Converte bytes BCD em string de dígitos (dois dígitos por byte)
+    return ''.join(f"{(x >> 4) & 0xF}{x & 0xF}" for x in b)
+
 def decode_bcd_imei(imei_bcd: bytes) -> str:
-    s = ''.join(f"{(b>>4)&0xF}{b&0xF}" for b in imei_bcd)
-    return s.lstrip('0')[:15]
+    """
+    Decodifica IMEI BCD de 8 bytes (formato GT06 clássico).
+    Ex.: b'\x08\x61\x26\x10\x29\x74\x03\x19' -> '861261029740319'
+    Regra: remover apenas o primeiro nibble '0' (caractere '0' inicial) se existir,
+    preservando zeros legítimos subsequentes.
+    """
+    s = _decode_bcd_pairs(imei_bcd)  # p.ex: '0861261029740319'
+    # Remover APENAS o primeiro caractere '0' (nibble alto de 0x08),
+    # não use lstrip('0') para não cortar zeros válidos.
+    if s and s[0] == '0':
+        s = s[1:]
+    return s[:15]
 
 def extract_login_imei_from_payload(payload: bytes) -> Optional[str]:
+    """
+    Extrai IMEI do payload do login:
+    - Formato ASCII: 0x0F + 15 dígitos.
+    - Formato BCD:   0x08 + 8 bytes BCD, onde o primeiro nibble é '0' e o segundo '8'.
+    Fallback: varre janelas de 8 bytes tentando decodificar IMEI BCD válido.
+    """
     if not payload:
         return None
+
     # ASCII 0x0F
     if payload[:1] == b"\x0F" and len(payload) >= 16:
         try:
-            s = payload[1:16].decode()
+            s = payload[1:16].decode(errors="ignore")
             if s.isdigit() and len(s) == 15:
                 return s
         except Exception:
             pass
+
     # BCD 0x08
     if payload[:1] == b"\x08" and len(payload) >= 9:
         s = decode_bcd_imei(payload[1:9])
         if s.isdigit() and len(s) == 15:
             return s
-    # fallback: varre janelas
+
+    # fallback: varre janelas (último recurso; mantém regra “remove só 1º nibble 0”)
     for i in range(0, max(0, len(payload) - 7)):
         s = decode_bcd_imei(payload[i:i+8])
         if s.isdigit() and len(s) == 15:
@@ -331,7 +359,7 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 logger.info("[GT06] RX proto=0x%02X body_len~%d cs_len=%d from=%s",
                             msg_type, body_len_approx, cs_len, peer)
 
-            # ACK
+            # ACK (ecoando serial quando disponível; checksum no mesmo modo do RX)
             ack = build_ack(0x7878 if hdr == b"\x78\x78" else 0x7979, msg_type, serial_bytes, checksum_mode)
             try:
                 writer.write(ack)
@@ -350,7 +378,7 @@ async def _frame_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     await handle_login(payload, binascii.hexlify(raw).decode().upper(), peer, state)
                 elif msg_type in (0x10, 0x11, 0x12, 0x16, 0x26):
                     await handle_gps(payload, binascii.hexlify(raw).decode().upper(), state)
-                # 0x13/0x08 → somente ACK
+                # 0x13/0x08/0x30/0x80 -> só ACK acima (mantido)
             except Exception as e:
                 logger.exception("[GT06] Erro no handler do tipo 0x%02X: %s", msg_type, e)
 
@@ -398,6 +426,12 @@ async def handle_gps(payload: bytes, raw_hex: str, state: ConnState):
 # ============================
 # Server
 # ============================
+class ConnState:
+    __slots__ = ("device", "imei_seen")
+    def __init__(self):
+        self.device: Optional[Dict[str, Any]] = None
+        self.imei_seen: Optional[str] = None
+
 async def gt06_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
     logger.info("[TRV/GT06] Conexao de %s", peer)
